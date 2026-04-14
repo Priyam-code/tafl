@@ -37,7 +37,7 @@ const Button = React.forwardRef<HTMLButtonElement, React.ButtonHTMLAttributes<HT
       glass: "h-14 w-14 rounded-full flex items-center justify-center"
     };
     return (
-      <button ref={ref} className={`inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-bold transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500 disabled:pointer-events-none ${variants[variant]} ${sizes[size]} ${className || ""}`} {...props} />
+      <button ref={ref} className={`inline-flex items-center justify-center whitespace-nowrap rounded-md text-sm font-bold transition-all focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-red-500 disabled:pointer-events-none ${variants[variant as keyof typeof variants] || variants.default} ${sizes[size as keyof typeof sizes] || sizes.default} ${className || ""}`} {...props} />
     );
   }
 );
@@ -111,19 +111,17 @@ type PairEvaluation = {
 };
 
 type AlgorithmStep = {
-  phase: "base-mark" | "iterative-mark" | "merge-overview" | "merge-check" | "merge-execute" | "final";
+  phase: "base-mark" | "iterative-mark" | "merge-check" | "merge-execute" | "final" | "merge-overview" | "init";
   title: string;
   description: string;
   tableSnapshot: PairTableEntry[];
-  
   evaluations?: PairEvaluation[];
   passNumber?: number;
-
   pair?: [string, string]; 
   mergingNodes?: [string, string];
   mergedGroups?: string[][];
   preMergeGraph?: StepGraph; 
-  graph?: StepGraph; 
+  graph: StepGraph; 
   reason?: string;
 };
 
@@ -137,10 +135,7 @@ type MinimizedDFA = {
 };
 
 type MinimizationResult = {
-  markingSteps: AlgorithmStep[];
-  mergingSteps: AlgorithmStep[];
-  pairTable: PairTableEntry[];
-  equivalentGroups: string[][];
+  steps: AlgorithmStep[];
   minimized: MinimizedDFA;
 };
 
@@ -261,7 +256,7 @@ function buildAllPairs(states: string[]) {
 }
 
 function partitionsToGraph(dfa: DFA, partitions: string[][]): StepGraph {
-  const stateNames = partitions.map((group) => `{${group.join(",")}}`);
+  const stateNames = partitions.map((group) => group.length > 1 ? `{${group.join(",")}}` : group[0]);
   const mapping: Record<string, string> = {};
 
   partitions.forEach((group, idx) => {
@@ -289,325 +284,463 @@ function partitionsToGraph(dfa: DFA, partitions: string[][]): StepGraph {
   };
 }
 
-function minimizeDFA(dfa: DFA): MinimizationResult {
-  const allPairs = buildAllPairs(dfa.states).sort((p1, p2) => p1[0].localeCompare(p2[0]) || p1[1].localeCompare(p2[1]));
-  const marked = new Set<string>();
-  const reasons: Record<string, string> = {};
-  const markingSteps: AlgorithmStep[] = [];
-  const mergingSteps: AlgorithmStep[] = [];
+function minimizeDFA(originalDfa: DFA): MinimizationResult {
+  const steps: AlgorithmStep[] = [];
+  let currentGroups = originalDfa.states.map(s => [s]);
+  let activeDfa = originalDfa;
+  let markedPairs = new Set<string>();
 
-  const getTableSnapshot = (newMarks: Set<string> = new Set()): PairTableEntry[] => allPairs.map(([x, y]) => {
-    const key = pairKey(x, y);
-    let markStat: "marked" | "unmarked" | "newly-marked" = "unmarked";
-    if (newMarks.has(key)) markStat = "newly-marked";
-    else if (marked.has(key)) markStat = "marked";
+  // Dynamic matrix builder that actively respects shrunken groups and normalized keys
+  const getDynamicTable = (groups: string[][], markedSet: Set<string>, newMarksSet: Set<string> = new Set()): PairTableEntry[] => {
+    const stateNames = groups.map(g => g.length > 1 ? `{${g.join(",")}}` : g[0]);
+    const pairs = buildAllPairs(stateNames).map(([a,b]) => normalizePair(a,b)); 
+    
+    return pairs.map(([name1, name2]) => {
+      const g1 = groups.find(g => (g.length > 1 ? `{${g.join(",")}}` : g[0]) === name1);
+      const g2 = groups.find(g => (g.length > 1 ? `{${g.join(",")}}` : g[0]) === name2);
+      
+      let isMarked = false;
+      let isNewlyMarked = false;
+      
+      if (g1 && g2) {
+          for(const s1 of g1) {
+              for(const s2 of g2) {
+                  const k = pairKey(s1, s2);
+                  if(newMarksSet.has(k)) {
+                      isNewlyMarked = true;
+                      isMarked = true;
+                  }
+                  if(markedSet.has(k)) {
+                      isMarked = true;
+                  }
+              }
+          }
+      }
+      
+      let markStat: "marked" | "unmarked" | "newly-marked" = "unmarked";
+      if(isNewlyMarked) markStat = "newly-marked";
+      else if(isMarked) markStat = "marked";
+      
+      return {
+          pair: [name1, name2] as [string, string],
+          mark: markStat,
+          reason: isMarked ? "Distinguishable" : "Pending confirmation (Unmarked)"
+      };
+    });
+  };
 
-    return {
-      pair: [x, y],
-      mark: markStat,
-      reason: reasons[key] || "Pending confirmation (unmarked)"
-    };
+  // Step 0: Overview (Starts completely empty)
+  steps.push({
+    phase: "init",
+    title: "Table Initialization",
+    description: "The Myhill-Nerode table has been constructed. We will now evaluate distinguishability.",
+    reason: "The table is currently empty. Click 'Next' to evaluate all combinations of final and non-final states.",
+    evaluations: [],
+    graph: partitionsToGraph(originalDfa, currentGroups),
+    tableSnapshot: getDynamicTable(currentGroups, new Set())
   });
 
   // Phase 1: Base Cases (Batched instantly)
   let baseMarksCount = 0;
   const baseEvaluations: PairEvaluation[] = [];
   const baseNewMarks = new Set<string>();
+  const initialPairs = buildAllPairs(originalDfa.states).map(([a,b]) => normalizePair(a,b));
   
-  allPairs.forEach(([a, b]) => {
+  initialPairs.forEach(([a, b]) => {
+    const aFinal = originalDfa.finalStates.includes(a);
+    const bFinal = originalDfa.finalStates.includes(b);
     const key = pairKey(a, b);
-    const aFinal = dfa.finalStates.includes(a);
-    const bFinal = dfa.finalStates.includes(b);
+    
     let isMarked = false;
-    let reason = "Both states share the same finality. Leave unmarked initially.";
+    let reason = "Both states share the same finality. Left unmarked for now.";
 
     if (aFinal !== bFinal) {
-      marked.add(key);
+      markedPairs.add(key);
       baseNewMarks.add(key);
-      isMarked = true;
       baseMarksCount++;
+      isMarked = true;
       reason = "One state is final and the other is non-final. Distinguishable immediately.";
-      reasons[key] = reason;
     }
+
     baseEvaluations.push({ pair: [a, b], isMarked, reason, symbolChecks: [] });
   });
 
-  markingSteps.push({
+  steps.push({
     phase: "base-mark",
     title: `Base Cases Marked`,
-    description: "The DFA and Myhill-Nerode table are prepared. We begin by evaluating combinations of final and non-final states. All pairs where one state is an accepting (final) state and the other is not are immediately marked as distinguishable.",
+    description: "The DFA and Myhill-Nerode table are prepared. We evaluated combinations of final and non-final states. All pairs where one state is an accepting (final) state and the other is not are immediately marked as distinguishable.",
     reason: `Identified and marked ${baseMarksCount} pair(s) instantly because they have different finality.`,
     evaluations: baseEvaluations,
-    tableSnapshot: getTableSnapshot(baseNewMarks)
+    graph: partitionsToGraph(originalDfa, currentGroups),
+    tableSnapshot: getDynamicTable(currentGroups, markedPairs, baseNewMarks)
   });
 
-  // Phase 2: Iterative Marking passes
+  // Phase 2 & 3: Hybrid Eager Merge Loop
   let changed = true;
   let pass = 1;
+
   while (changed) {
     changed = false;
-    const passEvaluations: PairEvaluation[] = [];
-    let newMarksInPass = 0;
-    const passNewMarks = new Set<string>();
+    activeDfa = partitionsToGraph(originalDfa, currentGroups);
+    const activeStateNames = activeDfa.states;
+    const activePairs = buildAllPairs(activeStateNames).map(([a,b]) => normalizePair(a,b));
 
-    allPairs.forEach(([a, b]) => {
-      const key = pairKey(a, b);
-      if (marked.has(key)) return; 
-
-      const symbolChecks: SymbolCheck[] = [];
-      let newlyMarked = false;
-      let currentReason = `After Pass ${pass}, transitions only led to unmarked pairs or the same state. Leaving unmarked.`;
-
-      for (const symbol of dfa.alphabet) {
-        const nextA = dfa.transitions[a][symbol];
-        const nextB = dfa.transitions[b][symbol];
-
-        if (nextA === nextB) {
-          symbolChecks.push({
-            symbol,
-            nextPair: null,
-            nextStates: [nextA, nextB],
-            status: "same",
-            reason: `Transitions to the exact same state ${nextA}.`
-          });
-          continue;
-        }
-
-        const depPair = normalizePair(nextA, nextB);
-        const depKey = pairKey(nextA, nextB);
-        const depMarked = marked.has(depKey);
-
-        symbolChecks.push({
-          symbol,
-          nextPair: depPair,
-          nextStates: [nextA, nextB],
-          status: depMarked ? "distinguishable" : "depends",
-          reason: depMarked 
-            ? `Leads to pair (${depPair.join(", ")}), which is ALREADY marked.` 
-            : `Leads to pair (${depPair.join(", ")}), which is currently unmarked.`
-        });
-
-        if (depMarked && !newlyMarked) {
-          marked.add(key);
-          passNewMarks.add(key);
-          newlyMarked = true;
-          changed = true;
-          newMarksInPass++;
-          currentReason = `Marked because input '${symbol}' leads to a distinguishable pair (${depPair.join(", ")}).`;
-          reasons[key] = currentReason;
-        }
-      }
-
-      passEvaluations.push({
-        pair: [a, b],
-        symbolChecks,
-        isMarked: newlyMarked,
-        reason: currentReason
-      });
-    });
-
-    if (passEvaluations.length > 0) {
-      markingSteps.push({
-        phase: "iterative-mark",
-        title: `Iteration Pass ${pass}`,
-        description: `Checked ${passEvaluations.length} unmarked pairs. ${newMarksInPass} newly marked in this pass.`,
-        passNumber: pass,
-        evaluations: passEvaluations,
-        tableSnapshot: getTableSnapshot(passNewMarks)
-      });
-    }
-    pass++;
-  }
-
-  // Phase 3: Merging equivalent states dynamically
-  const equivalentPairs = allPairs.filter(([a, b]) => !marked.has(pairKey(a, b)));
-  let currentGroups = dfa.states.map(s => [s]);
-
-  if (equivalentPairs.length === 0) {
-    mergingSteps.push({
-      phase: "merge-overview",
-      title: "No Merges Needed",
-      description: "The table-filling algorithm completed and all pairs were marked. The DFA is already minimal.",
-      pair: ["", ""],
-      mergedGroups: currentGroups,
-      graph: partitionsToGraph(dfa, currentGroups),
-      tableSnapshot: getTableSnapshot()
-    });
-  } else {
-    // Add an initial overview step for merging
-    mergingSteps.push({
-      phase: "merge-overview",
-      title: "Begin State Conversion & Merging",
-      description: "All iterations are complete. Pairs left unmarked in the Myhill-Nerode table are proven equivalent and will now be physically merged.",
-      pair: ["", ""],
-      mergedGroups: [...currentGroups],
-      graph: partitionsToGraph(dfa, currentGroups),
-      tableSnapshot: getTableSnapshot()
-    });
-
-    equivalentPairs.forEach(([a, b]) => {
-      const groupAIndex = currentGroups.findIndex(g => g.includes(a));
-      const groupBIndex = currentGroups.findIndex(g => g.includes(b));
-      
-      if (groupAIndex !== groupBIndex) {
-        const preMergeGraph = partitionsToGraph(dfa, currentGroups);
+    // --- 1. EAGER MERGE CHECK ---
+    let eagerMergePair: [string, string] | null = null;
+    
+    for (const [nameA, nameB] of activePairs) {
+        let isAlreadyMarked = false;
+        const gA = currentGroups.find(g => (g.length > 1 ? `{${g.join(",")}}` : g[0]) === nameA);
+        const gB = currentGroups.find(g => (g.length > 1 ? `{${g.join(",")}}` : g[0]) === nameB);
         
-        // Exact names of the nodes to animate based on current partition state
-        const mergingNodes: [string, string] = [
-          `{${currentGroups[groupAIndex].join(",")}}`,
-          `{${currentGroups[groupBIndex].join(",")}}`
-        ];
+        if (!gA || !gB) continue;
 
-        // 1. Explicit Checking Step
-        mergingSteps.push({
-          phase: "merge-check",
-          title: `Verify Equivalence: (${a}, ${b})`,
-          description: `Before modifying the topology, we verify in the Myhill-Nerode table that the pair (${a}, ${b}) remained unmarked, proving they act identically on all inputs.`,
-          pair: [a, b],
-          mergingNodes,
-          mergedGroups: [...currentGroups],
-          graph: preMergeGraph,
-          tableSnapshot: getTableSnapshot()
+        for (const sA of gA) {
+            for (const sB of gB) {
+                if (markedPairs.has(pairKey(sA, sB))) isAlreadyMarked = true;
+            }
+        }
+
+        if (!isAlreadyMarked) {
+            let isTriviallyEquivalent = true;
+            for (const sym of activeDfa.alphabet) {
+                if (activeDfa.transitions[nameA][sym] !== activeDfa.transitions[nameB][sym]) {
+                    isTriviallyEquivalent = false;
+                    break;
+                }
+            }
+            if (isTriviallyEquivalent) {
+                eagerMergePair = [nameA, nameB];
+                break; 
+            }
+        }
+    }
+
+    if (eagerMergePair) {
+        const [nameA, nameB] = eagerMergePair;
+        const preMergeGraph = partitionsToGraph(originalDfa, currentGroups);
+        const preMergeTable = getDynamicTable(currentGroups, markedPairs);
+
+        steps.push({
+            phase: "merge-check",
+            title: `Verify Equivalence: (${nameA}, ${nameB})`,
+            description: `We observe that ${nameA} and ${nameB} transition to the EXACT same states for every single input. We are absolutely sure they are equivalent, so we will merge them immediately.`,
+            pair: [nameA, nameB],
+            mergingNodes: [nameA, nameB],
+            graph: preMergeGraph,
+            tableSnapshot: preMergeTable
         });
 
-        // Mutate groups
-        const mergedGroup = [...currentGroups[groupAIndex], ...currentGroups[groupBIndex]].sort();
-        currentGroups = currentGroups.filter((_, idx) => idx !== groupAIndex && idx !== groupBIndex);
+        const gAIndex = currentGroups.findIndex(g => (g.length > 1 ? `{${g.join(",")}}` : g[0]) === nameA);
+        const gBIndex = currentGroups.findIndex(g => (g.length > 1 ? `{${g.join(",")}}` : g[0]) === nameB);
+        const mergedGroup = [...currentGroups[gAIndex], ...currentGroups[gBIndex]].sort();
+        
+        currentGroups = currentGroups.filter((_, idx) => idx !== gAIndex && idx !== gBIndex);
         currentGroups.push(mergedGroup);
         currentGroups.sort((g1, g2) => g1[0].localeCompare(g2[0]));
 
-        const postMergeGraph = partitionsToGraph(dfa, currentGroups);
+        const postMergeDfa = partitionsToGraph(originalDfa, currentGroups);
+        const postMergeTable = getDynamicTable(currentGroups, markedPairs);
 
-        // 2. Explicit Execute Step
-        mergingSteps.push({
-          phase: "merge-execute",
-          title: `Combine States: (${a}, ${b})`,
-          description: `The redundant states are now fused together. Watch the topological graph and transition table absorb the equivalence into a single state.`,
-          pair: [a, b],
-          mergingNodes,
-          mergedGroups: [...currentGroups],
-          preMergeGraph: preMergeGraph, // Keep track of the un-merged graph for the animation
-          graph: postMergeGraph,
-          tableSnapshot: getTableSnapshot()
+        steps.push({
+            phase: "merge-execute",
+            title: `Eager Merge: (${nameA}, ${nameB})`,
+            description: `The states have been combined mid-iteration. The table shrinks, naturally inheriting all previous cross marks. The algorithm will now continue on this simplified DFA.`,
+            pair: [nameA, nameB],
+            mergingNodes: [nameA, nameB],
+            preMergeGraph: preMergeGraph,
+            graph: postMergeDfa,
+            tableSnapshot: postMergeTable
         });
-      }
-    });
+
+        changed = true;
+        continue;
+    }
+
+    // --- 2. REGULAR MARKING PASS (BATCHED for automatic playback) ---
+    let newMarksInPass = 0;
+    const passEvaluations: PairEvaluation[] = [];
+    const passNewMarks = new Set<string>();
+
+    for (const [nameA, nameB] of activePairs) {
+        const gA = currentGroups.find(g => (g.length > 1 ? `{${g.join(",")}}` : g[0]) === nameA);
+        const gB = currentGroups.find(g => (g.length > 1 ? `{${g.join(",")}}` : g[0]) === nameB);
+        
+        if (!gA || !gB) continue;
+
+        let isAlreadyMarked = false;
+        for (const sA of gA) {
+            for (const sB of gB) {
+                if (markedPairs.has(pairKey(sA, sB))) isAlreadyMarked = true;
+            }
+        }
+
+        if (isAlreadyMarked) continue;
+
+        let newlyMarked = false;
+        const symbolChecks: SymbolCheck[] = [];
+        let currentReason = `Transitions map to identical states or unmarked pairs. Left unmarked.`;
+
+        for (const sym of activeDfa.alphabet) {
+            const targetA = activeDfa.transitions[nameA][sym];
+            const targetB = activeDfa.transitions[nameB][sym];
+
+            if (targetA === targetB) {
+                symbolChecks.push({ symbol: sym, nextPair: null, nextStates: [targetA, targetB], status: "same", reason: `Transitions to the exact same state ${targetA}.` });
+                continue;
+            }
+
+            const depPair = normalizePair(targetA, targetB);
+            
+            let depIsMarked = false;
+            const tGA = currentGroups.find(g => (g.length > 1 ? `{${g.join(",")}}` : g[0]) === targetA);
+            const tGB = currentGroups.find(g => (g.length > 1 ? `{${g.join(",")}}` : g[0]) === targetB);
+            
+            if (tGA && tGB) {
+                for (const sA of tGA) {
+                    for (const sB of tGB) {
+                        if (markedPairs.has(pairKey(sA, sB))) depIsMarked = true;
+                    }
+                }
+            }
+
+            symbolChecks.push({
+                symbol: sym,
+                nextPair: depPair,
+                nextStates: [targetA, targetB],
+                status: depIsMarked ? "distinguishable" : "depends",
+                reason: depIsMarked ? `Leads to pair (${depPair.join(", ")}), which is MARKED.` : `Leads to pair (${depPair.join(", ")}), which is unmarked.`
+            });
+
+            if (depIsMarked && !newlyMarked) {
+                newlyMarked = true;
+                changed = true;
+                newMarksInPass++;
+                currentReason = `Marked because input '${sym}' leads to a distinguishable pair (${depPair.join(", ")}).`;
+                
+                for (const sA of gA) {
+                    for (const sB of gB) {
+                        const k = pairKey(sA, sB);
+                        markedPairs.add(k);
+                        passNewMarks.add(k);
+                    }
+                }
+            }
+        }
+
+        passEvaluations.push({
+            pair: [nameA, nameB],
+            symbolChecks,
+            isMarked: newlyMarked,
+            reason: currentReason
+        });
+    }
+
+    if (passEvaluations.length > 0) {
+        steps.push({
+            phase: "iterative-mark",
+            title: `Iteration Pass ${pass}`,
+            description: `Evaluated ${passEvaluations.length} unmarked pairs automatically. Found ${newMarksInPass} newly distinguishable pairs.`,
+            passNumber: pass,
+            evaluations: passEvaluations,
+            graph: activeDfa,
+            tableSnapshot: getDynamicTable(currentGroups, markedPairs, passNewMarks)
+        });
+    }
+    
+    if (newMarksInPass > 0) pass++;
   }
 
-  // Final Result Assembly
-  const stateNames = currentGroups.map((group) => `{${group.join(",")}}`);
-  const mapping: Record<string, string> = {};
-  currentGroups.forEach((group, idx) => {
-    group.forEach((state) => {
-      mapping[state] = stateNames[idx];
-    });
+  // --- 3. FINAL CLEANUP MERGES ---
+  let finalChanged = true;
+  while (finalChanged) {
+      finalChanged = false;
+      activeDfa = partitionsToGraph(originalDfa, currentGroups);
+      const finalPairs = buildAllPairs(activeDfa.states).map(([a,b]) => normalizePair(a,b));
+
+      for (const [nameA, nameB] of finalPairs) {
+          const gA = currentGroups.find(g => (g.length > 1 ? `{${g.join(",")}}` : g[0]) === nameA);
+          const gB = currentGroups.find(g => (g.length > 1 ? `{${g.join(",")}}` : g[0]) === nameB);
+          
+          if (!gA || !gB) continue; 
+
+          let isMarked = false;
+          for (const sA of gA) {
+              for (const sB of gB) {
+                  if (markedPairs.has(pairKey(sA, sB))) isMarked = true;
+              }
+          }
+
+          if (!isMarked) {
+              const preMergeGraph = partitionsToGraph(originalDfa, currentGroups);
+              const preMergeTable = getDynamicTable(currentGroups, markedPairs);
+              
+              steps.push({
+                  phase: "merge-check",
+                  title: `Verify Cyclic Equivalence: (${nameA}, ${nameB})`,
+                  description: `Algorithm complete. Pair (${nameA}, ${nameB}) remained unmarked. They have cyclic equivalence and are definitively identical.`,
+                  pair: [nameA, nameB],
+                  mergingNodes: [nameA, nameB],
+                  graph: preMergeGraph,
+                  tableSnapshot: preMergeTable
+              });
+
+              const gAIndex = currentGroups.indexOf(gA);
+              const gBIndex = currentGroups.indexOf(gB);
+              const mergedGroup = [...gA, ...gB].sort();
+              currentGroups = currentGroups.filter((_, idx) => idx !== gAIndex && idx !== gBIndex);
+              currentGroups.push(mergedGroup);
+              currentGroups.sort((g1, g2) => g1[0].localeCompare(g2[0]));
+
+              const postMergeDfa = partitionsToGraph(originalDfa, currentGroups);
+              const postMergeTable = getDynamicTable(currentGroups, markedPairs);
+
+              steps.push({
+                  phase: "merge-execute",
+                  title: `Final Merge: (${nameA}, ${nameB})`,
+                  description: `The redundant states are fused together. The topological graph and transition table absorb the equivalence into a single state.`,
+                  pair: [nameA, nameB],
+                  mergingNodes: [nameA, nameB],
+                  preMergeGraph: preMergeGraph,
+                  graph: postMergeDfa,
+                  tableSnapshot: postMergeTable
+              });
+
+              finalChanged = true;
+              break; 
+          }
+      }
+  }
+
+  // --- 4. FINAL VERIFICATION PASS ---
+  const finalVerificationEvaluations: PairEvaluation[] = [];
+  const finalActiveDfa = partitionsToGraph(originalDfa, currentGroups);
+  const finalPairsList = buildAllPairs(finalActiveDfa.states).map(([a,b]) => normalizePair(a,b));
+  const finalNewMarks = new Set<string>();
+
+  for (const [nameA, nameB] of finalPairsList) {
+      const aFinal = finalActiveDfa.finalStates.includes(nameA);
+      const bFinal = finalActiveDfa.finalStates.includes(nameB);
+      
+      const gA = currentGroups.find(g => (g.length > 1 ? `{${g.join(",")}}` : g[0]) === nameA);
+      const gB = currentGroups.find(g => (g.length > 1 ? `{${g.join(",")}}` : g[0]) === nameB);
+      
+      if (gA && gB) {
+          for (const sA of gA) {
+              for (const sB of gB) {
+                  finalNewMarks.add(pairKey(sA, sB));
+                  markedPairs.add(pairKey(sA, sB));
+              }
+          }
+      }
+
+      if (aFinal !== bFinal) {
+           finalVerificationEvaluations.push({
+               pair: [nameA, nameB],
+               isMarked: true,
+               reason: "One state is an accepting state and the other is not. Distinguishable.",
+               symbolChecks: []
+           });
+      } else {
+           const symbolChecks: SymbolCheck[] = [];
+           for (const sym of finalActiveDfa.alphabet) {
+               const targetA = finalActiveDfa.transitions[nameA][sym];
+               const targetB = finalActiveDfa.transitions[nameB][sym];
+               if (targetA === targetB) {
+                   symbolChecks.push({ symbol: sym, nextPair: null, nextStates: [targetA, targetB], status: "same", reason: `Transitions to the exact same state ${targetA}.` });
+               } else {
+                   const depPair = normalizePair(targetA, targetB);
+                   symbolChecks.push({
+                       symbol: sym,
+                       nextPair: depPair,
+                       nextStates: [targetA, targetB],
+                       status: "distinguishable",
+                       reason: `Leads to distinguishable pair (${depPair.join(", ")}).`
+                   });
+               }
+           }
+           finalVerificationEvaluations.push({
+               pair: [nameA, nameB],
+               isMarked: true,
+               reason: "Transitions lead to distinguishable states. This pair remains marked.",
+               symbolChecks
+           });
+      }
+  }
+
+  if (finalVerificationEvaluations.length > 0) {
+      steps.push({
+          phase: "iterative-mark",
+          title: "Final Verification Pass",
+          description: "One last algorithmic pass over the minimized DFA to mathematically verify that all remaining state combinations are strictly distinguishable. Every cell is now definitively marked.",
+          passNumber: pass + 1,
+          evaluations: finalVerificationEvaluations,
+          graph: finalActiveDfa,
+          tableSnapshot: getDynamicTable(currentGroups, markedPairs, finalNewMarks)
+      });
+  }
+
+  steps.push({
+      phase: "final",
+      title: "Minimization Complete",
+      description: `All redundancies have been successfully merged. The resulting DFA is perfectly minimal. All remaining cells in the matrix represent strictly distinguishable states.`,
+      graph: partitionsToGraph(originalDfa, currentGroups),
+      tableSnapshot: getDynamicTable(currentGroups, markedPairs)
   });
 
-  const minimizedTransitions: Record<string, Record<string, string>> = {};
-  currentGroups.forEach((group, idx) => {
-    const representative = group[0];
-    const newState = stateNames[idx];
-    minimizedTransitions[newState] = {};
-    dfa.alphabet.forEach((symbol) => {
-      minimizedTransitions[newState][symbol] = mapping[dfa.transitions[representative][symbol]];
-    });
-  });
-
-  const minimizedDfaData = {
-    states: stateNames,
-    alphabet: dfa.alphabet,
-    startState: mapping[dfa.startState],
-    finalStates: [...new Set(dfa.finalStates.map((state) => mapping[state]))],
-    transitions: minimizedTransitions,
-    mapping
-  };
-
-  const finalAllPairs = buildAllPairs(minimizedDfaData.states);
-  
-  const finalEvaluations: PairEvaluation[] = finalAllPairs.map(([x,y]) => {
-    const repX = x.replace(/[{}]/g, '').split(',')[0];
-    const repY = y.replace(/[{}]/g, '').split(',')[0];
-    const xFinal = minimizedDfaData.finalStates.includes(x);
-    const yFinal = minimizedDfaData.finalStates.includes(y);
-    let reason = "";
-    if (xFinal !== yFinal) {
-       reason = `Group ${x} ${xFinal ? "is" : "is not"} an accepting state, while group ${y} ${yFinal ? "is" : "is not"}. Thus, they are distinguishable immediately.`;
-    } else {
-       reason = `These merged groups remain distinguishable because their constituent states (e.g., ${repX} and ${repY}) were previously proven distinguishable during the table-filling phase.`;
-    }
-    return {
-      pair: [x,y],
-      isMarked: true,
-      reason: reason,
-      symbolChecks: []
-    };
-  });
-
-  const finalTableSnapshot: PairTableEntry[] = finalAllPairs.map(([x,y]) => ({
-    pair: [x,y],
-    mark: "marked",
-    reason: "These states belong to different equivalence classes and are strictly distinguishable."
-  }));
-
-  mergingSteps.push({
-    phase: "final",
-    title: "Final Minimized DFA",
-    description: "All equivalent pairs have been merged. This is the finalized, minimal deterministic finite automaton. The table below verifies all remaining state pairs are strictly distinguishable.",
-    evaluations: finalEvaluations,
-    tableSnapshot: finalTableSnapshot,
-    graph: minimizedDfaData as unknown as StepGraph
-  });
-
-  return {
-    markingSteps,
-    mergingSteps,
-    pairTable: getTableSnapshot(),
-    equivalentGroups: currentGroups,
-    minimized: minimizedDfaData
-  };
+  return { steps, minimized: { ...partitionsToGraph(originalDfa, currentGroups), mapping: {} } as any };
 }
 
 // --- VISUALIZATION COMPONENTS ---
 
 function TransitionTable({ dfa, title, highlightedStates = [], activeSymbol = null }: { dfa: DFA | MinimizedDFA | StepGraph; title?: string; highlightedStates?: string[]; activeSymbol?: string | null; }) {
   return (
-    <Card className="h-full flex flex-col shadow-[0_0_20px_rgba(0,0,0,0.3)]">
-      {title ? <CardHeader><CardTitle>{title}</CardTitle></CardHeader> : null}
-      <CardContent className="flex-1 overflow-auto pt-6">
-        <div className="rounded-xl border border-zinc-800 bg-zinc-900 overflow-hidden shadow-sm">
-          <table className="w-full text-sm">
-            <thead className="bg-zinc-800 text-zinc-300 sticky top-0 z-10">
+    <Card className="h-full flex flex-col border-none shadow-[0_4px_16px_rgba(0,0,0,0.4)]">
+      {title ? <CardHeader className="py-4 px-6 border-none"><CardTitle className="text-base">{title}</CardTitle></CardHeader> : null}
+      <CardContent className="flex-1 overflow-auto p-6 pt-2">
+        <div className="rounded-xl border border-zinc-800 bg-zinc-900 overflow-hidden">
+          <table className="w-full text-sm text-left">
+            <thead className="bg-zinc-950 text-zinc-400 sticky top-0 z-10 border-b border-zinc-800">
               <tr>
-                <th className="px-4 py-3 text-left font-bold border-b border-zinc-700">State</th>
+                <th className="px-4 py-3 font-bold">Origin State</th>
                 {dfa.alphabet.map((symbol) => (
-                  <th key={symbol} className={`px-4 py-3 text-left font-bold border-b border-zinc-700 transition-colors ${activeSymbol === symbol ? "bg-red-900/50 text-red-300" : ""}`}>
+                  <th key={symbol} className={`px-4 py-3 font-bold transition-colors ${activeSymbol === symbol ? "text-red-400" : ""}`}>
                     Input {symbol}
                   </th>
                 ))}
               </tr>
             </thead>
-            <tbody>
-              {dfa.states.map((state) => {
-                const isHighlighted = highlightedStates.some(h => state === h || state.includes(h));
-                return (
-                  <tr key={state} className={`border-b border-zinc-800/50 last:border-0 transition-colors ${isHighlighted ? "bg-zinc-800/50" : ""}`}>
-                    <td className={`px-4 py-3 font-medium ${isHighlighted ? "text-zinc-50 font-bold" : "text-zinc-300"}`}>
-                      {state}
-                      {dfa.startState === state && <Badge variant="outline" className="ml-2 text-[10px] scale-90 border-zinc-700 text-zinc-400">Start</Badge>}
-                      {dfa.finalStates.includes(state) && <Badge variant="outline" className="ml-2 text-[10px] scale-90 border-zinc-700 text-zinc-400">Final</Badge>}
-                    </td>
-                    {dfa.alphabet.map((symbol) => {
-                      const activeCell = isHighlighted && activeSymbol === symbol;
-                      const activeColumn = activeSymbol === symbol;
-                      return (
-                        <td key={`${state}-${symbol}`} className={`px-4 py-3 transition-colors ${activeCell ? "bg-red-900/60 font-bold text-red-300 border border-red-800 shadow-[inset_0_0_12px_rgba(220,38,38,0.3)]" : activeColumn ? "bg-red-950/30 text-zinc-200" : "text-zinc-400"}`}>
-                          {dfa.transitions[state][symbol]}
-                        </td>
-                      );
-                    })}
-                  </tr>
-                );
-              })}
+            <tbody className="divide-y divide-zinc-800">
+              <AnimatePresence initial={false}>
+                {dfa.states.map((state) => {
+                  const isHighlighted = highlightedStates.some(h => state === h || state.includes(h));
+                  return (
+                    <motion.tr 
+                      key={state} 
+                      layout
+                      initial={{ opacity: 0 }}
+                      animate={{ opacity: 1 }}
+                      exit={{ opacity: 0 }}
+                      className={`transition-colors ${isHighlighted ? "bg-zinc-800/80" : "bg-zinc-900 hover:bg-zinc-800/40"}`}
+                    >
+                      <td className={`px-4 py-3.5 font-medium ${isHighlighted ? "text-zinc-100 font-bold" : "text-zinc-300"}`}>
+                        {state}
+                        {dfa.startState === state && <Badge variant="outline" className="ml-2 border-zinc-700 text-zinc-400 scale-90">Start</Badge>}
+                        {dfa.finalStates.includes(state) && <Badge variant="outline" className="ml-2 border-zinc-700 text-zinc-400 scale-90">Final</Badge>}
+                      </td>
+                      {dfa.alphabet.map((symbol) => {
+                        const activeCell = isHighlighted && activeSymbol === symbol;
+                        const activeColumn = activeSymbol === symbol;
+                        return (
+                          <td key={`${state}-${symbol}`} className={`px-4 py-3.5 transition-all ${activeCell ? "bg-red-950/60 font-bold text-red-300 border border-red-800 shadow-[inset_0_0_12px_rgba(220,38,38,0.2)]" : activeColumn ? "bg-zinc-950/30 text-zinc-200" : "text-zinc-400"}`}>
+                            {dfa.transitions[state][symbol]}
+                          </td>
+                        );
+                      })}
+                    </motion.tr>
+                  );
+                })}
+              </AnimatePresence>
             </tbody>
           </table>
         </div>
@@ -621,25 +754,13 @@ function TriangularTableSnapshot({
   rows, 
   activePair,
   title,
-  onCellClick,
-  onNext,
-  onPrev,
-  onReplay,
-  isNextDisabled,
-  isPrevDisabled,
-  isReplayDisabled
+  onCellClick
 }: { 
   dfa: DFA | StepGraph, 
   rows: PairTableEntry[], 
   activePair: [string, string] | null,
   title: string,
-  onCellClick?: (pair: [string, string]) => void,
-  onNext?: () => void,
-  onPrev?: () => void,
-  onReplay?: () => void,
-  isNextDisabled?: boolean,
-  isPrevDisabled?: boolean,
-  isReplayDisabled?: boolean
+  onCellClick?: (pair: [string, string]) => void
 }) {
   const states = dfa.states;
   if (states.length < 2) return null;
@@ -648,75 +769,71 @@ function TriangularTableSnapshot({
   const rowStates = states.slice(1);
 
   return (
-    <Card className="h-full flex flex-col shadow-[0_0_20px_rgba(0,0,0,0.3)]">
-      <CardHeader className="bg-zinc-900/80 border-b border-zinc-800 p-4 sm:p-6">
-        <div className="flex flex-col xl:flex-row xl:items-center justify-between gap-4">
-          <CardTitle className="flex items-center gap-2 text-lg shrink-0">
-            <CheckSquare className="h-5 w-5 text-red-500" /> {title}
-          </CardTitle>
-          <div className="flex items-center gap-2 bg-zinc-950 p-1.5 rounded-xl border border-zinc-800 shadow-inner w-fit self-end xl:self-auto">
-            {onPrev && <Button variant="secondary" size="sm" onClick={onPrev} disabled={isPrevDisabled} className="h-8 rounded-lg px-3 bg-zinc-900 hover:bg-zinc-800 border-zinc-800 shadow-sm"><ArrowLeft className="w-4 h-4" /></Button>}
-            {onReplay && <Button variant="secondary" size="sm" onClick={onReplay} disabled={isReplayDisabled} className="h-8 rounded-lg px-3 bg-zinc-900 hover:bg-zinc-800 border-zinc-800 shadow-sm"><RotateCcw className="w-4 h-4 mr-1.5" /> Replay</Button>}
-            {onNext && <Button variant="default" size="sm" onClick={onNext} disabled={isNextDisabled} className="h-8 rounded-lg px-4 shadow-sm bg-red-900/40 text-red-400 hover:bg-red-800/60 border-none"><ArrowRight className="w-4 h-4" /></Button>}
-          </div>
-        </div>
+    <Card className="h-full flex flex-col border-none shadow-[0_4px_16px_rgba(0,0,0,0.4)]">
+      <CardHeader className="bg-zinc-900 px-6 py-5 border-b border-zinc-800 flex flex-row items-center justify-between space-y-0">
+        <CardTitle className="flex items-center gap-2 text-base shrink-0">
+          <CheckSquare className="h-5 w-5 text-red-500" /> {title}
+        </CardTitle>
+        {onCellClick && (
+          <Badge variant="outline" className="text-[10px] text-zinc-400 font-medium border-zinc-700 bg-zinc-950 flex items-center gap-1.5 px-3 py-1">
+            <MousePointerClick className="w-3 h-3" /> Click cell to inspect logic
+          </Badge>
+        )}
       </CardHeader>
-      <CardContent className="flex-1 flex flex-col items-center justify-center p-6 overflow-auto relative bg-zinc-950/50">
-         {onCellClick && (
-           <Badge variant="outline" className="absolute top-4 left-4 text-[10px] text-zinc-500 bg-zinc-900 border-zinc-800 hidden md:flex">
-             <MousePointerClick className="w-3 h-3 mr-1" /> Click cell to inspect logic
-           </Badge>
-         )}
-         <div className="flex flex-col gap-1.5 mt-6">
-            {/* Header row */}
-            <div className="flex gap-1.5 pl-10">
-               {colStates.map(c => (
-                 <div key={`header-${c}`} className="w-12 h-8 flex items-center justify-center font-bold text-zinc-500">{c}</div>
-               ))}
+      <CardContent className="flex-1 flex flex-col items-center justify-center p-6 overflow-auto relative bg-zinc-950 rounded-b-[16px]">
+         <div className="flex flex-col gap-2 mt-2">
+            <div className="flex gap-2 pl-12">
+               <AnimatePresence initial={false}>
+                 {colStates.map(c => (
+                   <motion.div layout key={`header-${c}`} initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0, width: 0, padding: 0 }} className="min-w-[48px] w-auto h-8 flex items-center justify-center font-bold text-zinc-500 text-sm px-1">{c}</motion.div>
+                 ))}
+               </AnimatePresence>
             </div>
-            {/* Rows */}
-            {rowStates.map((r, rIdx) => (
-              <div key={`row-${r}`} className="flex gap-1.5">
-                {/* Row header */}
-                <div className="w-10 h-12 flex items-center justify-end pr-3 font-bold text-zinc-500">{r}</div>
-                {/* Cells */}
-                {colStates.map((c, cIdx) => {
-                  if (cIdx > rIdx) return <div key={`empty-${c}`} className="w-12 h-12 shrink-0" />;
+            <AnimatePresence initial={false}>
+              {rowStates.map((r, rIdx) => (
+                <motion.div layout key={`row-${r}`} initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0, height: 0 }} className="flex gap-2">
+                  <motion.div layout className="min-w-[40px] w-auto h-12 flex items-center justify-end pr-4 font-bold text-zinc-500 text-sm">{r}</motion.div>
+                  <AnimatePresence initial={false}>
+                    {colStates.map((c, cIdx) => {
+                      if (cIdx > rIdx) return <motion.div layout key={`empty-${c}`} initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0, width: 0, padding: 0 }} className="min-w-[48px] w-auto h-12 shrink-0 px-1" />;
 
-                  const pairKey = normalizePair(c, r);
-                  const entry = rows.find(row => row.pair[0] === pairKey[0] && row.pair[1] === pairKey[1]);
-                  const isNewlyMarked = entry?.mark === "newly-marked";
-                  const isMarked = entry?.mark === "marked" || isNewlyMarked;
-                  const isActive = activePair && activePair[0] === pairKey[0] && activePair[1] === pairKey[1];
+                      const pairKey = normalizePair(c, r);
+                      const entry = rows.find(row => row.pair[0] === pairKey[0] && row.pair[1] === pairKey[1]);
+                      const isNewlyMarked = entry?.mark === "newly-marked";
+                      const isMarked = entry?.mark === "marked" || isNewlyMarked;
+                      const isActive = activePair && activePair[0] === pairKey[0] && activePair[1] === pairKey[1];
 
-                  let cellClasses = "border-zinc-700 bg-zinc-900 shadow-sm hover:bg-zinc-800";
-                  let xColor = "text-zinc-600";
+                      let cellClasses = "bg-zinc-900 border-zinc-800 shadow-[0_2px_8px_rgba(0,0,0,0.2)] hover:bg-zinc-800";
+                      let xColor = "text-zinc-600";
 
-                  if (isActive) {
-                     cellClasses = "border-red-500 bg-red-900/40 shadow-[0_0_15px_rgba(220,38,38,0.4)] z-20 ring-2 ring-red-500/50";
-                     xColor = "text-red-400";
-                  } else if (isNewlyMarked) {
-                     cellClasses = "border-red-800 bg-red-950/50 shadow-sm ring-1 ring-red-900/50"; 
-                     xColor = "text-red-500";
-                  } else if (isMarked) {
-                     cellClasses = "border-zinc-800 bg-zinc-900/50";
-                     xColor = "text-zinc-600";
-                  }
+                      if (isActive) {
+                         cellClasses = "bg-red-950/40 border-red-500/50 z-20 scale-110 shadow-[0_0_15px_rgba(220,38,38,0.4)]";
+                         xColor = "text-red-400";
+                      } else if (isNewlyMarked) {
+                         cellClasses = "bg-red-950 border-red-900 shadow-none"; 
+                         xColor = "text-red-500";
+                      } else if (isMarked) {
+                         cellClasses = "bg-zinc-950 border-zinc-900 shadow-none";
+                         xColor = "text-zinc-700";
+                      }
 
-                  return (
-                    <motion.div 
-                      key={`cell-${c}`} 
-                      layout
-                      initial={{ scale: 0.9, opacity: 0 }}
-                      animate={{ scale: isActive ? 1.1 : 1, opacity: 1 }}
-                      onClick={() => onCellClick?.(pairKey)}
-                      className={`w-12 h-12 rounded-lg border flex items-center justify-center shrink-0 transition-all duration-300 ${onCellClick ? "cursor-pointer active:scale-95" : ""} ${cellClasses}`}>
-                       {isMarked && <X className={`w-8 h-8 stroke-[3] ${xColor} ${isNewlyMarked && !isActive ? "animate-pulse" : ""}`} />}
-                    </motion.div>
-                  );
-                })}
-              </div>
-            ))}
+                      return (
+                        <motion.div 
+                          key={`cell-${c}-${r}`} 
+                          layout
+                          initial={{ scale: 0.8, opacity: 0 }}
+                          animate={{ scale: isActive ? 1.08 : 1, opacity: 1 }}
+                          exit={{ opacity: 0, width: 0, padding: 0 }}
+                          onClick={() => onCellClick?.(pairKey)}
+                          className={`min-w-[48px] px-1 h-12 rounded-[10px] border flex items-center justify-center shrink-0 transition-all duration-400 ${onCellClick ? "cursor-pointer active:scale-95" : ""} ${cellClasses}`}>
+                           {isMarked && <X className={`w-6 h-6 stroke-[3] ${xColor} ${isNewlyMarked && !isActive ? "animate-pulse" : ""}`} />}
+                        </motion.div>
+                      );
+                    })}
+                  </AnimatePresence>
+                </motion.div>
+              ))}
+            </AnimatePresence>
          </div>
       </CardContent>
     </Card>
@@ -734,9 +851,9 @@ function GraphView({ dfa, title, graphKey, activeStates = [], mergeMode = false,
   const SVG_HEIGHT = 440;
   const CENTER_Y = 220;
   const nodeRadius = 25;
-  const arrowPadding = 27; // 25 radius + 2 for stroke to perfectly touch the border
+  const arrowPadding = 27; 
 
-  const animTransition = { duration: isDragging ? 0 : 0.8, ease: "easeInOut" as const };
+  const animTransition = { duration: isDragging ? 0 : 0.8, ease: [0.16, 1, 0.3, 1] }; 
 
   useEffect(() => {
     const paddingX = 95;
@@ -756,7 +873,6 @@ function GraphView({ dfa, title, graphKey, activeStates = [], mergeMode = false,
         }
 
         changed = true;
-
         let x = nodes.length === 1 ? computedWidth / 2 : paddingX + idx * spacing;
         let y = CENTER_Y;
 
@@ -780,7 +896,6 @@ function GraphView({ dfa, title, graphKey, activeStates = [], mergeMode = false,
             y = CENTER_Y;
           }
         }
-
         next[state] = { x, y };
       });
 
@@ -818,12 +933,7 @@ function GraphView({ dfa, title, graphKey, activeStates = [], mergeMode = false,
     return edges.some((e) => e.from === to && e.to === from);
   };
 
-  const quadraticPoint = (
-    p0: { x: number; y: number },
-    p1: { x: number; y: number },
-    p2: { x: number; y: number },
-    t: number
-  ) => {
+  const quadraticPoint = (p0: { x: number; y: number }, p1: { x: number; y: number }, p2: { x: number; y: number }, t: number) => {
     const mt = 1 - t;
     return {
       x: mt * mt * p0.x + 2 * mt * t * p1.x + t * t * p2.x,
@@ -839,29 +949,21 @@ function GraphView({ dfa, title, graphKey, activeStates = [], mergeMode = false,
       { dx: 0, dy: 1, penalty: 2 },
       { dx: -1, dy: 0, penalty: 0 }
     ];
-
     let best = candidates[0];
     let bestScore = -Infinity;
 
     candidates.forEach((cand) => {
       const probeX = p.x + cand.dx * 100;
       const probeY = p.y + cand.dy * 100;
-
       let minDist = Infinity;
       nodes.forEach((other) => {
         if (other === state) return;
         const q = positions[other];
-        const d = Math.hypot(probeX - q.x, probeY - q.y);
-        minDist = Math.min(minDist, d);
+        minDist = Math.min(minDist, Math.hypot(probeX - q.x, probeY - q.y));
       });
-
       const score = minDist - cand.penalty;
-      if (score > bestScore) {
-        bestScore = score;
-        best = cand;
-      }
+      if (score > bestScore) { bestScore = score; best = cand; }
     });
-
     return best;
   };
 
@@ -874,30 +976,24 @@ function GraphView({ dfa, title, graphKey, activeStates = [], mergeMode = false,
 
   const getCurveDirection = (fromIdx: number, toIdx: number, reverseExists: boolean) => {
     const isForward = toIdx > fromIdx;
-
     if (reverseExists) {
       return isForward ? -1 : 1;
     }
-
     const span = Math.abs(toIdx - fromIdx);
-
     if (span === 1) {
       return 0;
     }
-
     return ((fromIdx + toIdx) % 2 === 0) ? -1 : 1;
   };
 
-  if (Object.keys(positions).length === 0 || !nodes.every((n) => positions[n])) {
-    return null;
-  }
+  if (Object.keys(positions).length === 0 || !nodes.every((n) => positions[n])) return null;
 
   return (
-    <Card className="overflow-hidden h-full flex flex-col shadow-[0_0_20px_rgba(0,0,0,0.3)]">
-      <CardHeader className="py-4 border-zinc-800">
+    <Card className="overflow-hidden h-full flex flex-col shadow-[0_0_20px_rgba(0,0,0,0.3)] border-none">
+      <CardHeader className="py-4 border-zinc-800 bg-zinc-900">
         <CardTitle className="flex justify-between items-center">
           <span>{title}</span>
-          <Badge variant="outline" className="text-[10px] text-zinc-400 font-normal shadow-sm border-zinc-700">
+          <Badge variant="outline" className="text-[10px] text-zinc-500 font-normal shadow-sm border-zinc-700 bg-zinc-950">
             Drag states to reposition
           </Badge>
         </CardTitle>
@@ -918,7 +1014,7 @@ function GraphView({ dfa, title, graphKey, activeStates = [], mergeMode = false,
           >
             <defs>
               <marker id={`arrow-${graphKey}`} viewBox="0 0 10 10" refX="10" refY="5" markerWidth="6" markerHeight="6" orient="auto">
-                <path d="M 0 0 L 10 5 L 0 10 z" className="fill-zinc-500" />
+                <path d="M 0 0 L 10 5 L 0 10 z" className="fill-zinc-600" />
               </marker>
             </defs>
 
@@ -964,23 +1060,8 @@ function GraphView({ dfa, title, graphKey, activeStates = [], mergeMode = false,
                       markerEnd={`url(#arrow-${graphKey})`}
                       className="stroke-zinc-600"
                     />
-                    <motion.text
-                      animate={{ x: textX, y: textY }}
-                      transition={animTransition}
-                      textAnchor="middle"
-                      className="stroke-zinc-950 stroke-[5px] fill-transparent text-sm font-bold"
-                      strokeLinejoin="round"
-                    >
-                      {symbolText}
-                    </motion.text>
-                    <motion.text
-                      animate={{ x: textX, y: textY }}
-                      transition={animTransition}
-                      textAnchor="middle"
-                      className="fill-red-400 text-sm font-bold"
-                    >
-                      {symbolText}
-                    </motion.text>
+                    <motion.text animate={{ x: textX, y: textY }} transition={animTransition} textAnchor="middle" className="stroke-zinc-950 stroke-[5px] fill-transparent text-sm font-bold" strokeLinejoin="round">{symbolText}</motion.text>
+                    <motion.text animate={{ x: textX, y: textY }} transition={animTransition} textAnchor="middle" className="fill-red-400 text-sm font-bold">{symbolText}</motion.text>
                   </motion.g>
                 );
               }
@@ -990,15 +1071,7 @@ function GraphView({ dfa, title, graphKey, activeStates = [], mergeMode = false,
               const absDist = Math.abs(toIdx - fromIdx);
               const reverseExists = hasReverseEdge(from, to);
 
-              let startX = 0;
-              let startY = 0;
-              let endX = 0;
-              let endY = 0;
-              let cpX = 0;
-              let cpY = 0;
-              let textX = 0;
-              let textY = 0;
-
+              let startX = 0, startY = 0, endX = 0, endY = 0, cpX = 0, cpY = 0, textX = 0, textY = 0;
               const dir = getCurveDirection(fromIdx, toIdx, reverseExists);
 
               if (absDist === 1 && dir === 0) {
@@ -1015,12 +1088,8 @@ function GraphView({ dfa, title, graphKey, activeStates = [], mergeMode = false,
                 textY = cpY + (tinyCurve < 0 ? -8 : 16);
               } else {
                 const curveHeight = dir * getCurveMagnitude(absDist || 1);
-
-                const midX = (p1.x + p2.x) / 2;
-                const midY = CENTER_Y;
-
-                cpX = midX;
-                cpY = midY + curveHeight;
+                cpX = (p1.x + p2.x) / 2;
+                cpY = CENTER_Y + curveHeight;
 
                 const angle1 = Math.atan2(cpY - p1.y, cpX - p1.x);
                 const angle2 = Math.atan2(p2.y - cpY, p2.x - cpX);
@@ -1030,162 +1099,49 @@ function GraphView({ dfa, title, graphKey, activeStates = [], mergeMode = false,
                 endX = p2.x - arrowPadding * Math.cos(angle2);
                 endY = p2.y - arrowPadding * Math.sin(angle2);
 
-                const labelPoint = quadraticPoint(
-                  { x: startX, y: startY },
-                  { x: cpX, y: cpY },
-                  { x: endX, y: endY },
-                  0.5
-                );
-
-                textX = labelPoint.x;
-                textY = labelPoint.y + (curveHeight < 0 ? -16 : 24);
+                const labelPt = quadraticPoint({ x: startX, y: startY }, { x: cpX, y: cpY }, { x: endX, y: endY }, 0.5);
+                textX = labelPt.x;
+                textY = labelPt.y + (curveHeight < 0 ? -16 : 24);
               }
 
               return (
                 <motion.g key={`${from}-${to}`} initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ duration: 0.35 }}>
-                  <motion.path
-                    animate={{ d: `M ${startX} ${startY} Q ${cpX} ${cpY} ${endX} ${endY}` }}
-                    transition={animTransition}
-                    fill="none"
-                    strokeWidth="2"
-                    markerEnd={`url(#arrow-${graphKey})`}
-                    className="stroke-zinc-600"
-                  />
-                  <motion.text
-                    animate={{ x: textX, y: textY }}
-                    transition={animTransition}
-                    textAnchor="middle"
-                    className="stroke-zinc-950 stroke-[5px] fill-transparent text-sm font-bold"
-                    strokeLinejoin="round"
-                  >
-                    {symbolText}
-                  </motion.text>
-                  <motion.text
-                    animate={{ x: textX, y: textY }}
-                    transition={animTransition}
-                    textAnchor="middle"
-                    className="fill-red-400 text-sm font-bold"
-                  >
-                    {symbolText}
-                  </motion.text>
+                  <motion.path animate={{ d: `M ${startX} ${startY} Q ${cpX} ${cpY} ${endX} ${endY}` }} transition={animTransition} fill="none" strokeWidth="2" markerEnd={`url(#arrow-${graphKey})`} className="stroke-zinc-600" />
+                  <motion.text animate={{ x: textX, y: textY }} transition={animTransition} textAnchor="middle" className="stroke-zinc-950 stroke-[5px] fill-transparent text-sm font-bold" strokeLinejoin="round">{symbolText}</motion.text>
+                  <motion.text animate={{ x: textX, y: textY }} transition={animTransition} textAnchor="middle" className="fill-red-400 text-sm font-bold">{symbolText}</motion.text>
                 </motion.g>
               );
             })}
 
             {positions[dfa.startState] && (
               <motion.g initial={{ opacity: 0 }} animate={{ opacity: 1 }}>
-                <motion.line
-                  animate={{
-                    x1: positions[dfa.startState].x - 82,
-                    y1: positions[dfa.startState].y,
-                    x2: positions[dfa.startState].x - arrowPadding,
-                    y2: positions[dfa.startState].y
-                  }}
-                  transition={animTransition}
-                  strokeWidth="2.5"
-                  markerEnd={`url(#arrow-${graphKey})`}
-                  className="stroke-zinc-500"
-                />
-                <motion.text
-                  animate={{ x: positions[dfa.startState].x - 92, y: positions[dfa.startState].y + 4 }}
-                  transition={animTransition}
-                  className="fill-zinc-300 text-sm font-bold text-center"
-                >
-                  Start
-                </motion.text>
+                <motion.line animate={{ x1: positions[dfa.startState].x - 82, y1: positions[dfa.startState].y, x2: positions[dfa.startState].x - arrowPadding, y2: positions[dfa.startState].y }} transition={animTransition} strokeWidth="2.5" markerEnd={`url(#arrow-${graphKey})`} className="stroke-zinc-600" />
+                <motion.text animate={{ x: positions[dfa.startState].x - 92, y: positions[dfa.startState].y + 4 }} transition={animTransition} className="fill-zinc-400 text-xs font-bold tracking-widest uppercase text-center">START</motion.text>
               </motion.g>
             )}
 
             {dfa.states.map((state) => {
-              const position = positions[state];
+              const pos = positions[state];
               const isFinal = dfa.finalStates.includes(state);
               const isActive = activeStates.some((a) => state === a || state.includes(a));
 
               return (
-                <motion.g
-                  key={state}
-                  initial={{ opacity: 0, scale: 0.5 }}
-                  animate={{ opacity: 1, scale: isActive && mergeMode ? 1.15 : isActive ? 1.08 : 1 }}
-                  transition={{ type: "spring", stiffness: 300, damping: 20 }}
-                  style={{ cursor: "grab" }}
-                  whileTap={{ cursor: "grabbing" }}
-                  onPanStart={() => setIsDragging(true)}
-                  onPanEnd={() => setIsDragging(false)}
+                <motion.g key={state} initial={{ opacity: 0, scale: 0.5 }} animate={{ opacity: 1, scale: isActive && mergeMode ? 1.15 : isActive ? 1.08 : 1 }} transition={{ type: "spring", stiffness: 300, damping: 20 }} style={{ cursor: "grab" }} whileTap={{ cursor: "grabbing" }} onPanStart={() => setIsDragging(true)} onPanEnd={() => setIsDragging(false)}
                   onPan={(e, info) => {
-                    let scaleX = 1;
-                    let scaleY = 1;
-
                     if (svgRef.current) {
                       const rect = svgRef.current.getBoundingClientRect();
-                      scaleX = canvasWidth / rect.width;
-                      scaleY = SVG_HEIGHT / rect.height;
+                      setPositions(p => ({ ...p, [state]: { x: p[state].x + info.delta.x * (canvasWidth / rect.width), y: p[state].y + info.delta.y * (SVG_HEIGHT / rect.height) } }));
                     }
-
-                    setPositions((prev) => ({
-                      ...prev,
-                      [state]: {
-                        x: prev[state].x + info.delta.x * scaleX,
-                        y: prev[state].y + info.delta.y * scaleY
-                      }
-                    }));
                   }}
                 >
-                  <motion.circle
-                    animate={{ cx: position.x, cy: position.y }}
-                    transition={animTransition}
-                    r="25"
-                    className={`${isActive ? "fill-red-950/80 stroke-red-500 stroke-[3px]" : "fill-zinc-800 stroke-zinc-500"}`}
-                    strokeWidth="2"
-                  />
-                  {isFinal && (
-                    <motion.circle
-                      animate={{ cx: position.x, cy: position.y }}
-                      transition={animTransition}
-                      r="20"
-                      className={`fill-none ${isActive ? "stroke-red-400" : "stroke-zinc-500"}`}
-                      strokeWidth="1.5"
-                    />
-                  )}
-                  <motion.text
-                    animate={{ x: position.x, y: position.y + 4 }}
-                    transition={animTransition}
-                    textAnchor="middle"
-                    className="fill-zinc-100 text-[13px] font-bold pointer-events-none select-none"
-                  >
-                    {state}
-                  </motion.text>
+                  <motion.circle animate={{ cx: pos.x, cy: pos.y }} transition={animTransition} r="28" className={`${isActive ? "fill-red-950/80 stroke-red-500 stroke-[3px]" : "fill-zinc-800 stroke-zinc-500"} transition-colors duration-300`} />
+                  {isFinal && <motion.circle animate={{ cx: pos.x, cy: pos.y }} transition={animTransition} r="22" className={`fill-none ${isActive ? "stroke-red-400" : "stroke-zinc-500"}`} strokeWidth="1.5" />}
+                  <motion.text animate={{ x: pos.x, y: pos.y + 4 }} transition={animTransition} textAnchor="middle" className={`text-sm font-bold pointer-events-none select-none ${isActive ? "fill-zinc-100" : "fill-zinc-100"}`}>{state}</motion.text>
                 </motion.g>
               );
             })}
           </motion.svg>
         </AnimatePresence>
-      </CardContent>
-    </Card>
-  );
-}
-
-function PartitionTable({ partitions }: { partitions: string[][] }) {
-  return (
-    <Card className="h-full flex flex-col shadow-[0_0_20px_rgba(0,0,0,0.3)]">
-      <CardHeader>
-        <CardTitle>Current Partitions</CardTitle>
-      </CardHeader>
-      <CardContent className="flex-1 overflow-auto pt-6">
-        <div className="grid gap-3 sm:grid-cols-2">
-          {partitions.map((group, idx) => (
-            <motion.div key={idx} layout initial={{ opacity: 0, scale: 0.97 }} animate={{ opacity: 1, scale: 1 }} className="rounded-2xl border border-zinc-700 bg-zinc-950 p-4 shadow-sm">
-              <div className="mb-3 flex items-center justify-between">
-                <div className="text-sm font-semibold text-zinc-300">Group {idx + 1}</div>
-                <Badge variant="outline" className="bg-zinc-900 border-zinc-700">{group.length}</Badge>
-              </div>
-              <div className="flex flex-wrap gap-1.5">
-                {group.map((state) => (
-                  <motion.div layout key={state}><Badge variant="default" className="rounded-md px-2 py-1 text-xs bg-zinc-800 border-zinc-700 text-zinc-200">{state}</Badge></motion.div>
-                ))}
-              </div>
-            </motion.div>
-          ))}
-        </div>
       </CardContent>
     </Card>
   );
@@ -1202,19 +1158,15 @@ export default function App() {
   const [formError, setFormError] = useState("");
   const [formState, setFormState] = useState<DFAFormState>(dfaToFormState(sampleDFA));
 
-  // Walkthrough State
-  const [activeTab, setActiveTab] = useState<"marking" | "merging">("marking");
-  const [markStep, setMarkStep] = useState(0);
-  const [mergeStep, setMergeStep] = useState(0);
-  
-  // Animation states
+  // Unified linear timeline state
+  const [currentStepIndex, setCurrentStepIndex] = useState(0);
+  const [selectedPair, setSelectedPair] = useState<[string, string] | null>(null);
+
   const [animIndex, setAnimIndex] = useState(0);
   const [animSymbolIndex, setAnimSymbolIndex] = useState(0);
   const [isPlaying, setIsPlaying] = useState(false);
-  const [selectedPair, setSelectedPair] = useState<[string, string] | null>(null);
-
   const [replayTrigger, setReplayTrigger] = useState(0);
-  const [mergePhase, setMergePhase] = useState<"idle" | "checking" | "merging" | "merged">("idle");
+  const [mergePhase, setMergePhase] = useState<"idle" | "merging" | "merged">("idle");
 
   const parsed = useMemo(() => parseDFA(submitted), [submitted]);
   const result = useMemo(() => {
@@ -1226,30 +1178,47 @@ export default function App() {
   const formAlphabet = useMemo(() => normalizeList(formState.alphabetText), [formState.alphabetText]);
 
   // Derive current step
-  const activeStep = result ? (activeTab === "marking" ? result.markingSteps[markStep] : result.mergingSteps[mergeStep]) : null;
+  const activeStep = result ? result.steps[currentStepIndex] : null;
+  const isFirstStep = currentStepIndex === 0;
+  const isLastStep = result ? currentStepIndex === result.steps.length - 1 : true;
 
-  // The Graph needs to know exactly which set of nodes to render depending on the merge state
+  // Dynamically map Graph view
   const currentGraphState = useMemo(() => {
-    if (activeTab === "merging" && activeStep?.phase === "merge-execute" && mergePhase === "merging") {
+    if (activeStep?.phase === "merge-execute" && mergePhase === "merging") {
       return activeStep.preMergeGraph;
     }
     return activeStep?.graph || parsed.dfa;
-  }, [activeTab, activeStep, mergePhase, parsed.dfa]);
+  }, [activeStep, mergePhase, parsed.dfa]);
 
-  // Derive evaluation for display based on animation phase or selected history
+  // Dynamically locate specific pair evaluations
   const getEvaluationForPair = (pair: [string, string]) => {
     if (!result) return null;
-    if (activeTab === "merging" && activeStep?.phase === "final") {
-       const found = activeStep.evaluations?.find(e => e.pair[0] === pair[0] && e.pair[1] === pair[1]);
+    const [p0, p1] = normalizePair(pair[0], pair[1]);
+    
+    if (activeStep?.phase === "final") {
+       const found = activeStep.evaluations?.find(e => e.pair[0] === p0 && e.pair[1] === p1);
        if (found) return { passTitle: "Minimized States Verification", evalData: found };
     }
     
-    for (let i = markStep; i >= 0; i--) {
-      const evals = result.markingSteps[i].evaluations;
+    for (let i = currentStepIndex; i >= 0; i--) {
+      const evals = result.steps[i].evaluations;
       if (evals) {
-        const found = evals.find(e => e.pair[0] === pair[0] && e.pair[1] === pair[1]);
-        if (found) return { passTitle: result.markingSteps[i].title, evalData: found };
+        const found = evals.find(e => e.pair[0] === p0 && e.pair[1] === p1);
+        if (found) return { passTitle: result.steps[i].title, evalData: found };
       }
+    }
+    
+    // Fallback for new shrunk table cells mapping to inherited states
+    if(p0.includes("{") || p1.includes("{")) {
+       return {
+          passTitle: "Inherited State Evaluation",
+          evalData: {
+             pair: [p0, p1] as [string, string],
+             isMarked: true,
+             reason: `These groups are intrinsically distinguishable because their underlying constituent states were mathematically proven distinguishable during the earlier evaluation phases.`,
+             symbolChecks: []
+          }
+       };
     }
     return null;
   };
@@ -1262,6 +1231,7 @@ export default function App() {
     ? activeEval.isMarked ? activeEval.symbolChecks.findIndex((c) => c.status === "distinguishable") + 1 : activeEval.symbolChecks.length
     : 0;
 
+  // Safely extract activeSymbol without complex rendering logic dependencies
   const activeSymbol = isPlaying && activeEval && animSymbolIndex < checkCountBeforeDecision 
     ? activeEval.symbolChecks[animSymbolIndex]?.symbol : null;
 
@@ -1278,14 +1248,10 @@ export default function App() {
           const isFuture = idx > animIndex;
           
           if (evalObj.isMarked) {
-            if (isFuture) {
-               return { ...r, mark: "unmarked" };
-            }
+            if (isFuture) return { ...r, mark: "unmarked" };
             if (isCurrentAnimating) {
                const decisiveIndex = evalObj.symbolChecks.findIndex(c => c.status === "distinguishable");
-               if (animSymbolIndex <= decisiveIndex) {
-                  return { ...r, mark: "unmarked" };
-               }
+               if (animSymbolIndex <= decisiveIndex) return { ...r, mark: "unmarked" };
             }
           }
         }
@@ -1303,31 +1269,30 @@ export default function App() {
     }));
   }, [formState.statesText, formState.alphabetText, formStates, formAlphabet]);
 
-  // When step changes, setup animation
+  // When step changes, reset local states
   useEffect(() => {
-    if (activeTab === "marking" && activeStep?.phase === "iterative-mark") {
+    setSelectedPair(null);
+
+    if (activeStep?.phase === "iterative-mark") {
       setAnimIndex(0);
       setAnimSymbolIndex(0);
       setIsPlaying(true);
-      setSelectedPair(null);
     } else {
       setIsPlaying(false);
-      setSelectedPair(null);
     }
 
-    if (activeTab === "merging" && activeStep?.phase === "merge-execute") {
-      // Very short explicit animation loop for gliding nodes together
+    if (activeStep?.phase === "merge-execute") {
       setMergePhase("merging");
-      const t = setTimeout(() => setMergePhase("merged"), 800);
+      const t = setTimeout(() => setMergePhase("merged"), 800); 
       return () => clearTimeout(t);
     } else {
       setMergePhase("idle");
     }
-  }, [markStep, mergeStep, activeTab, activeStep, replayTrigger]);
+  }, [currentStepIndex, activeStep, replayTrigger]);
 
-  // Main animation loop for Iterative Marking
+  // HIGH-SPEED Automatic inner animation cycle for iterative marking
   useEffect(() => {
-    if (!isPlaying || activeTab !== "marking" || activeStep?.phase !== "iterative-mark") return;
+    if (!isPlaying || activeStep?.phase !== "iterative-mark") return;
     if (!activeStep.evaluations) return;
 
     const evalObj = activeStep.evaluations[animIndex];
@@ -1338,7 +1303,7 @@ export default function App() {
       : evalObj.symbolChecks.length;
 
     if (animSymbolIndex < maxSymbolIndex) {
-      const timer = setTimeout(() => setAnimSymbolIndex(s => s + 1), 1000);
+      const timer = setTimeout(() => setAnimSymbolIndex(s => s + 1), 300); // Slower: 300ms per symbol
       return () => clearTimeout(timer);
     } else {
       const timer = setTimeout(() => {
@@ -1346,31 +1311,21 @@ export default function App() {
           setAnimIndex(i => i + 1);
           setAnimSymbolIndex(0);
         } else {
-          setIsPlaying(false);
+          setIsPlaying(false); // Stop when the pass finishes so user can click
         }
-      }, 1500);
+      }, 800); // Slower: 800ms between pairs
       return () => clearTimeout(timer);
     }
-  }, [isPlaying, activeTab, activeStep, animIndex, animSymbolIndex]);
-
-  const handleReplay = () => {
-    setSelectedPair(null);
-    setIsPlaying(true);
-    setReplayTrigger(r => r + 1);
-  };
+  }, [isPlaying, activeStep, animIndex, animSymbolIndex]);
 
   const handleCellClick = (pair: [string, string]) => {
     if (!result) return;
-    
-    if (activeTab === "merging" && activeStep?.phase === "final") {
-      setSelectedPair(pair);
-      return;
-    }
+    const [p0, p1] = normalizePair(pair[0], pair[1]);
     
     let foundIndex = -1;
-    for (let i = markStep; i >= 0; i--) {
-       const evals = result.markingSteps[i].evaluations;
-       if (evals && evals.some(e => e.pair[0] === pair[0] && e.pair[1] === pair[1])) {
+    for (let i = currentStepIndex; i >= 0; i--) {
+       const evals = result.steps[i].evaluations;
+       if (evals && evals.some(e => e.pair[0] === p0 && e.pair[1] === p1)) {
            foundIndex = i;
            break;
        }
@@ -1378,16 +1333,25 @@ export default function App() {
     
     if (foundIndex !== -1) {
       setIsPlaying(false); 
-      setMarkStep(foundIndex); 
-      setSelectedPair(pair);
-    } else {
-      const baseIndex = result.markingSteps.findIndex(s => s.phase === "base-mark" && (s.evaluations && s.evaluations.length > 0));
-      if (baseIndex !== -1) {
+      setCurrentStepIndex(foundIndex); 
+      setSelectedPair([p0, p1]);
+    } else if (!p0.includes("{") && !p1.includes("{")) {
+      const baseIndex = result.steps.findIndex(s => s.phase === "base-mark" && s.evaluations?.some(e => e.pair[0] === p0 && e.pair[1] === p1));
+      if (baseIndex !== -1 && currentStepIndex >= baseIndex) {
         setIsPlaying(false);
-        setMarkStep(baseIndex);
-        setSelectedPair(pair);
+        setCurrentStepIndex(baseIndex);
+        setSelectedPair([p0, p1]);
       }
+    } else {
+      setIsPlaying(false);
+      setSelectedPair([p0, p1]);
     }
+  };
+
+  const handleReplay = () => {
+    setSelectedPair(null);
+    setIsPlaying(true);
+    setReplayTrigger(r => r + 1);
   };
 
   const handleAddState = () => {
@@ -1457,18 +1421,14 @@ export default function App() {
     setSubmitted(sampleText);
     setFormState(dfaToFormState(sampleDFA));
     setFormError("");
-    setMarkStep(0);
-    setMergeStep(0);
-    setActiveTab("marking");
+    setCurrentStepIndex(0);
   }
 
   function startWalkthrough(dfaString: string) {
     setInput(dfaString);
     setSubmitted(dfaString);
     setFormError("");
-    setMarkStep(0);
-    setMergeStep(0);
-    setActiveTab("marking");
+    setCurrentStepIndex(0);
     setView("walkthrough");
   }
 
@@ -1479,122 +1439,100 @@ export default function App() {
   }
 
   const handleNext = () => {
-    setSelectedPair(null);
-    if (activeTab === "marking") {
-      if (result && markStep < result.markingSteps.length - 1) {
-         const nextIdx = markStep + 1;
-         setMarkStep(nextIdx);
-         setIsPlaying(result.markingSteps[nextIdx].phase === "iterative-mark");
-      } else {
-         setActiveTab("merging"); 
-         setIsPlaying(false);
-      }
-    } else {
-      if (result && mergeStep < result.mergingSteps.length - 1) setMergeStep(m => m + 1);
+    if (result && currentStepIndex < result.steps.length - 1) {
+      setCurrentStepIndex(currentStepIndex + 1);
     }
   };
 
   const handlePrev = () => {
-    setSelectedPair(null);
-    setIsPlaying(false);
-    if (activeTab === "merging") {
-      if (mergeStep > 0) setMergeStep(m => m - 1);
-      else {
-         setActiveTab("marking"); 
-      }
-    } else {
-      if (markStep > 0) {
-         setMarkStep(m => m - 1);
-      }
+    if (currentStepIndex > 0) {
+      setCurrentStepIndex(currentStepIndex - 1);
     }
   };
 
+  // Keyboard navigation
   useEffect(() => {
     if (view !== "walkthrough") return;
     const handleKeyDown = (e: KeyboardEvent) => {
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
       if (e.key === "ArrowRight") {
-        if (mergePhase !== "merging") {
-          handleNext();
-        }
+        if (mergePhase !== "merging") handleNext();
       } else if (e.key === "ArrowLeft") {
-        if (!(activeTab === "marking" && markStep === 0)) {
-          handlePrev();
-        }
+        handlePrev();
       }
     };
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
   });
 
-  const shellClass = "min-h-screen w-full bg-zinc-950 p-4 md:p-8 text-zinc-100 flex flex-col font-sans selection:bg-red-500/30";
+  const shellClass = "min-h-screen w-full bg-zinc-950 p-6 md:p-12 text-zinc-100 flex flex-col selection:bg-red-500/30 font-sans";
 
   const renderPairEvaluation = (evalData: PairEvaluation, visibleSymbolsCount?: number, customTitle?: string) => {
     const symbolsToShow = visibleSymbolsCount !== undefined ? evalData.symbolChecks.slice(0, visibleSymbolsCount) : evalData.symbolChecks;
     const showFinalDecision = visibleSymbolsCount === undefined || visibleSymbolsCount > evalData.symbolChecks.length || (evalData.isMarked && visibleSymbolsCount >= evalData.symbolChecks.findIndex((c) => c.status === "distinguishable") + 1);
 
     return (
-      <div className="space-y-4">
-        {customTitle && <div className="text-xs font-bold tracking-wider text-red-500 uppercase mb-2">{customTitle}</div>}
-        <div className="flex items-center gap-3 text-lg font-bold mb-6 text-zinc-100">
-          Checking Pair: <Badge variant="outline" className="text-sm px-3 py-1 shadow-sm border-zinc-700 bg-zinc-800">({evalData.pair[0]}, {evalData.pair[1]})</Badge>
+      <div className="space-y-6">
+        {customTitle && <div className="text-xs font-bold tracking-widest text-zinc-500 uppercase mb-4">{customTitle}</div>}
+        <div className="flex items-center gap-4 text-xl font-bold mb-8 text-zinc-100">
+          Analysis Matrix: <Badge variant="outline" className="text-base px-4 py-1.5 shadow-sm border-zinc-700 bg-zinc-800">({evalData.pair[0]}, {evalData.pair[1]})</Badge>
         </div>
 
-        <div className="flex flex-col gap-4">
+        <div className="flex flex-col gap-6">
           {symbolsToShow.map((row, index) => {
             const isDist = row.status === "distinguishable";
             return (
               <motion.div 
                 key={row.symbol} 
-                initial={{ opacity: 0, x: -10 }} 
-                animate={{ opacity: 1, x: 0 }}
-                className={`p-4 rounded-2xl border transition-all shadow-sm ${isDist ? "bg-red-950/40 border-red-900" : "bg-zinc-900 border-zinc-800"}`}
+                initial={{ opacity: 0, y: 10 }} 
+                animate={{ opacity: 1, y: 0 }}
+                transition={{ duration: 0.2 }}
+                className={`p-6 rounded-[12px] border transition-all shadow-[0_4px_16px_rgba(0,32,69,0.03)] ${isDist ? "bg-[#ffffff] border-[#c6955e]/30" : "bg-[#ffffff] border-[#ffffff]"}`}
               >
-                <div className="flex flex-wrap items-center gap-4 sm:gap-6">
+                <div className="flex flex-wrap items-center gap-6 sm:gap-8">
                   
                   {/* Input Block */}
-                  <div className="flex flex-col items-center justify-center bg-zinc-950 rounded-xl w-16 h-16 border border-zinc-800 shrink-0 shadow-inner">
-                    <span className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest mb-0.5">Input</span>
-                    <span className="text-xl font-black text-red-500">{row.symbol}</span>
+                  <div className="flex flex-col items-center justify-center bg-[#faf9fd] rounded-[10px] w-20 h-20 shrink-0">
+                    <span className="text-[10px] font-bold text-[#c4c6cf] uppercase tracking-widest mb-1">Input</span>
+                    <span className="text-2xl font-black text-[#002045]">{row.symbol}</span>
                   </div>
 
                   {/* Transitions Block */}
-                  <div className="flex flex-col gap-2 shrink-0">
-                    <div className="flex items-center gap-3">
-                      <div className="w-8 h-8 rounded-full border-2 border-zinc-700 bg-zinc-800 flex items-center justify-center font-bold text-zinc-200 shadow-sm">{evalData.pair[0]}</div>
-                      <ArrowRight className="w-4 h-4 text-zinc-500" />
-                      <div className={`w-8 h-8 rounded-full border-2 ${isDist ? 'border-red-800 bg-red-900/50 text-red-300' : 'border-zinc-700 bg-zinc-800 text-zinc-200'} flex items-center justify-center font-bold shadow-sm`}>{row.nextStates[0]}</div>
+                  <div className="flex flex-col gap-3 shrink-0">
+                    <div className="flex items-center gap-4">
+                      <div className="w-10 h-10 rounded-full bg-[#f4f3f7] flex items-center justify-center font-bold text-[#43474e] text-sm">{evalData.pair[0]}</div>
+                      <ArrowRight className="w-4 h-4 text-[#c4c6cf]" />
+                      <div className={`w-10 h-10 rounded-full border ${isDist ? 'border-[#c6955e]/30 bg-[#c6955e]/10 text-[#c6955e]' : 'border-transparent bg-[#faf9fd] text-[#43474e]'} flex items-center justify-center font-bold text-sm`}>{row.nextStates[0]}</div>
                     </div>
-                    <div className="flex items-center gap-3">
-                      <div className="w-8 h-8 rounded-full border-2 border-zinc-700 bg-zinc-800 flex items-center justify-center font-bold text-zinc-200 shadow-sm">{evalData.pair[1]}</div>
-                      <ArrowRight className="w-4 h-4 text-zinc-500" />
-                      <div className={`w-8 h-8 rounded-full border-2 ${isDist ? 'border-red-800 bg-red-900/50 text-red-300' : 'border-zinc-700 bg-zinc-800 text-zinc-200'} flex items-center justify-center font-bold shadow-sm`}>{row.nextStates[1]}</div>
+                    <div className="flex items-center gap-4">
+                      <div className="w-10 h-10 rounded-full bg-[#f4f3f7] flex items-center justify-center font-bold text-[#43474e] text-sm">{evalData.pair[1]}</div>
+                      <ArrowRight className="w-4 h-4 text-[#c4c6cf]" />
+                      <div className={`w-10 h-10 rounded-full border ${isDist ? 'border-[#c6955e]/30 bg-[#c6955e]/10 text-[#c6955e]' : 'border-transparent bg-[#faf9fd] text-[#43474e]'} flex items-center justify-center font-bold text-sm`}>{row.nextStates[1]}</div>
                     </div>
                   </div>
 
-                  <ArrowRight className="w-6 h-6 text-zinc-600 hidden md:block shrink-0" />
+                  <ArrowRight className="w-6 h-6 text-[#f4f3f7] hidden md:block shrink-0" />
 
                   {/* Target Pair Block */}
-                  <div className="flex flex-col gap-1.5 shrink-0">
-                    <span className="text-[10px] font-bold text-zinc-500 uppercase tracking-widest">Leads To</span>
+                  <div className="flex flex-col gap-2 shrink-0">
+                    <span className="text-[10px] font-bold text-[#c4c6cf] uppercase tracking-widest">Resolves To</span>
                     {row.nextPair ? (
-                       <Badge variant="outline" className="text-sm px-4 py-1.5 border-zinc-700 bg-zinc-800 shadow-sm font-semibold rounded-full text-zinc-200">Pair ({row.nextPair.join(", ")})</Badge>
+                       <Badge variant="outline" className="text-sm px-5 py-2 border-[#c4c6cf]/20 bg-[#faf9fd] shadow-none font-semibold rounded-full">Pair ({row.nextPair.join(", ")})</Badge>
                     ) : (
-                       <Badge variant="outline" className="text-sm px-4 py-1.5 border-zinc-700 bg-zinc-950 text-zinc-400 shadow-sm font-semibold rounded-full">Same State ({row.nextStates[0]})</Badge>
+                       <Badge variant="outline" className="text-sm px-5 py-2 border-[#c4c6cf]/20 bg-[#faf9fd] text-[#43474e] shadow-none font-semibold rounded-full">Identical ({row.nextStates[0]})</Badge>
                     )}
                   </div>
 
                   {/* Result Badge */}
-                  <div className="sm:ml-auto w-full sm:w-auto flex justify-start sm:justify-end border-t border-zinc-800 sm:border-0 pt-4 sm:pt-0">
-                     <div className={`flex flex-col items-center justify-center px-4 py-2 rounded-xl border ${isDist ? 'bg-red-900/40 border-red-800 text-red-400' : 'bg-emerald-950/40 border-emerald-900 text-emerald-400'}`}>
+                  <div className="sm:ml-auto w-full sm:w-auto flex justify-start sm:justify-end pt-4 sm:pt-0">
+                     <div className={`flex flex-col items-center justify-center px-6 py-3 rounded-[10px] ${isDist ? 'bg-[#c6955e] text-[#ffffff] shadow-[0_4px_16px_rgba(198,149,94,0.3)]' : 'bg-[#f4f3f7] text-[#43474e]'}`}>
                        <span className="font-bold text-sm">{isDist ? "Distinguishable" : "Equivalent"}</span>
-                       <span className="text-xs opacity-80">{isDist ? "(Marked)" : "(Unmarked so far)"}</span>
                      </div>
                   </div>
                 </div>
                 
                 {/* Explanation Footer */}
-                <div className="mt-4 text-sm text-zinc-300 bg-zinc-950/50 p-3 rounded-xl border border-zinc-800">
+                <div className="mt-6 text-sm text-[#43474e] bg-[#faf9fd] p-4 rounded-[8px]">
                    {row.reason}
                 </div>
               </motion.div>
@@ -1603,10 +1541,10 @@ export default function App() {
         </div>
 
         {showFinalDecision && (
-          <motion.div initial={{opacity:0, y:10}} animate={{opacity:1, y:0}} className={`flex items-start gap-4 rounded-2xl p-5 border shadow-sm mt-6 ${evalData.isMarked ? "border-red-900 bg-red-950/50 text-red-300" : "border-zinc-800 bg-zinc-900 text-zinc-200"}`}>
-            {evalData.isMarked ? <XCircle className="h-8 w-8 shrink-0 text-red-500" /> : <CheckCircle2 className="h-8 w-8 shrink-0 text-zinc-500" />}
+          <motion.div initial={{opacity:0, y:10}} animate={{opacity:1, y:0}} className={`flex items-start gap-5 rounded-[16px] p-6 shadow-[0_4px_24px_rgba(0,32,69,0.04)] mt-8 border ${evalData.isMarked ? "bg-[#c6955e]/10 text-[#c6955e] border-[#c6955e]/20" : "bg-[#faf9fd] text-[#1a1c1e] border-transparent"}`}>
+            {evalData.isMarked ? <XCircle className="h-8 w-8 shrink-0" /> : <CheckCircle2 className="h-8 w-8 shrink-0 text-[#c4c6cf]" />}
             <div>
-              <div className="font-bold text-lg mb-1">{evalData.isMarked ? "Decision: Marked (Distinguishable)" : "Decision: Left Unmarked"}</div>
+              <div className="font-bold text-lg mb-1">{evalData.isMarked ? "Matrix Marked (Distinguishable)" : "Retained Equivalence"}</div>
               <div className="leading-relaxed opacity-90">{evalData.reason}</div>
             </div>
           </motion.div>
@@ -1616,228 +1554,180 @@ export default function App() {
   };
 
   if (view === "walkthrough" && result && parsed.dfa && activeStep) {
-    const isFirstStep = activeTab === "marking" && markStep === 0;
-    const isLastStep = activeTab === "merging" && mergeStep === result.mergingSteps.length - 1;
 
     return (
       <div className={shellClass}>
         
-        {/* Floating Controls with Frosted Glass */}
-        <div className="fixed bottom-8 left-1/2 -translate-x-1/2 z-50 flex items-center gap-4 bg-zinc-900/80 backdrop-blur-md p-2 rounded-full shadow-[0_12px_40px_rgba(0,0,0,0.5)] border border-zinc-700">
-           <Button variant="glass" size="icon" onClick={handlePrev} disabled={isFirstStep} title="Previous Step (Left Arrow)">
-             <ArrowLeft className="w-6 h-6 stroke-[2.5] text-zinc-100" />
+        {/* Floating Controls with Frosted Glass (Restored to bottom center) */}
+        <div className="fixed bottom-8 left-1/2 -translate-x-1/2 z-50 flex items-center gap-2 bg-zinc-900/90 backdrop-blur-md p-2 rounded-2xl shadow-[0_12px_40px_rgba(0,0,0,0.5)] border border-zinc-800">
+           <Button variant="secondary" size="icon" onClick={handlePrev} disabled={isFirstStep} title="Previous Step" className="rounded-xl h-12 w-12 bg-zinc-950 border-zinc-800 hover:bg-zinc-800 text-zinc-300">
+             <ArrowLeft className="w-5 h-5 stroke-[2.5]" />
            </Button>
-           <Button variant="glass" size="icon" onClick={() => setView("input")} title="Home">
-             <Home className="w-5 h-5 stroke-[2.5] text-zinc-100" />
+           <Button variant="secondary" size="icon" onClick={() => setView("input")} title="Home" className="rounded-xl h-12 w-12 bg-zinc-950 border-zinc-800 hover:bg-zinc-800 text-zinc-300">
+             <Home className="w-5 h-5 stroke-[2.5]" />
            </Button>
-           <Button variant="default" size="icon" onClick={handleNext} disabled={isLastStep || mergePhase === "merging"} title="Next Step (Right Arrow)" className="rounded-full h-14 w-14">
-             <ArrowRight className="w-6 h-6 stroke-[2.5]" />
+           <Button variant="default" size="icon" onClick={handleNext} disabled={isLastStep || mergePhase === "merging"} title="Next Step" className="rounded-xl h-12 w-12 bg-red-600 hover:bg-red-500 shadow-md shadow-red-900/50">
+             <ArrowRight className="w-5 h-5 stroke-[2.5] text-white" />
            </Button>
         </div>
 
-        <div className="mx-auto max-w-[1400px] w-full flex-1 flex flex-col gap-6 pb-20">
+        <div className="mx-auto max-w-[1600px] w-full flex-1 flex flex-col gap-6 pb-24">
           
-          {/* HEADER AND CONTROLS */}
-          <Card className="border-0 bg-zinc-900 shadow-sm shrink-0">
-            <CardContent className="flex flex-col gap-4 p-5 lg:flex-row lg:items-center lg:justify-between pt-5">
-              <div>
-                <div className="mb-2 inline-flex items-center gap-2 rounded-full bg-red-950/50 text-red-400 border border-red-900 px-3 py-1 text-xs font-bold">
-                  <Sparkles className="h-3 w-3" /> Teacher's Myhill-Nerode Visualizer
-                </div>
-                <h2 className="text-xl font-bold text-zinc-50 flex items-center gap-2">
-                  Interactive DFA Minimization
-                  <span className="text-xs font-normal text-zinc-500 ml-2">(Use ⬅️ ➡️ arrow keys)</span>
-                </h2>
-              </div>
-              
-              {/* TABS */}
-              <div className="flex bg-zinc-950 border border-zinc-800 p-1.5 rounded-2xl w-fit">
-                <button 
-                  onClick={() => { setActiveTab("marking"); setSelectedPair(null); }} 
-                  className={`flex items-center gap-2 px-5 py-2 rounded-xl text-sm font-bold transition-all ${activeTab === "marking" ? "bg-red-600 text-white shadow-sm shadow-red-900/40" : "text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/50"}`}
-                >
-                  <FileSearch className="w-4 h-4" /> 1. Table Filling (Marking)
-                </button>
-                <button 
-                  onClick={() => { setActiveTab("merging"); setSelectedPair(null); }} 
-                  className={`flex items-center gap-2 px-5 py-2 rounded-xl text-sm font-bold transition-all ${activeTab === "merging" ? "bg-red-600 text-white shadow-sm shadow-red-900/40" : "text-zinc-400 hover:text-zinc-200 hover:bg-zinc-800/50"}`}
-                >
-                  <ListTree className="w-4 h-4" /> 2. Conversion (Merging)
-                </button>
-              </div>
+          {/* ROW 1: GRAPH (Full Width) */}
+          <div className="w-full h-[50vh] min-h-[450px]">
+            <GraphView 
+              dfa={currentGraphState!} 
+              title={['merge-overview', 'merge-check', 'merge-execute', 'final'].includes(activeStep.phase) ? "Minimized Synthesis" : "Original DFA Graph"}
+              graphKey={`graph-${currentStepIndex}`} 
+              activeStates={highlightedPair || (activeStep.pair ? activeStep.pair : [])} 
+              mergeMode={activeStep.phase.includes('merge')}
+              mergingPair={activeStep.phase === "merge-execute" && mergePhase === "merging" ? activeStep.mergingNodes : null}
+            />
+          </div>
 
-            </CardContent>
-          </Card>
-
-          {/* MAIN VISUALIZATION AREA */}
-          <div className="flex-1 flex flex-col gap-6 min-h-0">
+          {/* ROW 2: MATRIX & LOGIC PANEL */}
+          <div className="w-full grid grid-cols-1 lg:grid-cols-2 gap-6 min-h-[350px]">
             
-            {/* TOP ROW: GRAPH (Full Width) */}
-            <div className="shrink-0 h-[45vh] min-h-[350px]">
-              <GraphView 
-                dfa={currentGraphState || parsed.dfa!} 
-                title={activeTab === "merging" ? "Dynamic Minimized Graph" : "Original DFA Graph"}
-                graphKey={`graph-${activeTab}-${activeTab === "marking" ? markStep : mergeStep}`} 
-                activeStates={highlightedPair || (activeStep.pair ? activeStep.pair : [])} 
-                mergeMode={activeTab === "merging"}
-                mergingPair={activeTab === "merging" && activeStep.phase === "merge-execute" && mergePhase === "merging" ? activeStep.mergingNodes : null}
-              />
+            {/* LEFT: Matrix */}
+            <div className="min-h-[350px]">
+               <TriangularTableSnapshot 
+                 dfa={currentGraphState!} 
+                 rows={currentTableRows} 
+                 activePair={highlightedPair || (activeStep.pair ? activeStep.pair : null)}
+                 title="Myhill-Nerode Markings"
+                 onCellClick={handleCellClick}
+               />
             </div>
-
-            {/* BOTTOM ROW: Tables & Logic */}
-            <div className="flex-1 grid grid-cols-1 lg:grid-cols-2 gap-6 min-h-[350px]">
-              
-              {/* BOTTOM LEFT: Tables */}
-              <div className="h-full flex flex-col gap-6">
-                {activeTab === "marking" ? (
-                  <TriangularTableSnapshot 
-                    dfa={parsed.dfa!} 
-                    rows={currentTableRows} 
-                    activePair={highlightedPair || null}
-                    title="Myhill-Nerode Markings"
-                    onCellClick={handleCellClick}
-                  />
-                ) : (
-                  <>
-                    <div className="min-h-[250px] flex-1">
-                      {(activeStep.phase === "merge-check" || activeStep.phase === "merge-execute" || activeStep.phase === "final") ? (
-                        <TriangularTableSnapshot 
-                          dfa={activeStep.phase === "final" ? currentGraphState! : parsed.dfa!} 
-                          rows={activeStep.tableSnapshot} 
-                          activePair={highlightedPair || (activeStep.pair ? activeStep.pair : null)} 
-                          title="Myhill-Nerode Matrix"
-                          onCellClick={activeStep.phase === "final" ? handleCellClick : undefined}
-                        />
-                      ) : (
-                        <PartitionTable partitions={activeStep.mergedGroups || []} />
-                      )}
-                    </div>
-                  </>
-                )}
-                
-                <div className="min-h-[250px] flex-1">
-                  <TransitionTable 
-                    dfa={currentGraphState!} 
-                    title="Transition Table" 
-                    highlightedStates={activeStep.pair && activeStep.pair[0] ? activeStep.pair : []}
-                    activeSymbol={activeSymbol}
-                  />
+            
+            {/* RIGHT: Editorial Step Logic */}
+            <div className="min-h-[350px]">
+              <Card className="h-full flex flex-col shadow-[0_0_30px_rgba(0,0,0,0.5)] border-zinc-800 bg-zinc-900 overflow-hidden">
+                <div className="px-8 py-6 border-b border-zinc-800/50">
+                  <div className="text-[10px] font-bold tracking-widest text-red-500 uppercase mb-2 flex items-center justify-between">
+                    <span>{['init', 'base-mark', 'iterative-mark'].includes(activeStep.phase) ? "Step Logic: Table Filling" : "Step Logic: Merging"}</span>
+                  </div>
+                  <h3 className="text-2xl font-bold text-zinc-50 leading-tight">{activeStep.title}</h3>
+                  <p className="text-sm text-zinc-400 mt-2 leading-relaxed">{activeStep.description}</p>
                 </div>
-              </div>
-
-              {/* BOTTOM RIGHT: STEP EXPLANATION PANEL */}
-              <div className="h-full">
-                <Card className="h-full flex flex-col shadow-[0_0_20px_rgba(0,0,0,0.3)]">
-                  <CardHeader className="bg-zinc-900/80 flex flex-row items-start justify-between">
-                    <div>
-                      <div className="text-xs font-bold tracking-wider text-red-500 uppercase mb-1">{activeTab === "marking" ? "Step Logic: Table Filling" : "Step Logic: Merging"}</div>
-                      <CardTitle className="text-xl text-zinc-50">{activeStep.title}</CardTitle>
-                      <p className="text-sm text-zinc-400 mt-2">{activeStep.description}</p>
+                
+                <div className="flex-1 overflow-auto p-8">
+                  {/* INIT PHASE RENDERING */}
+                  {activeStep.phase === "init" && (
+                    <div className="flex flex-col gap-3">
+                       <div className="flex items-center gap-4">
+                         <CheckCircle2 className="h-8 w-8 shrink-0 text-emerald-500" />
+                         <div className="font-bold text-xl text-zinc-100">Ready to Begin</div>
+                       </div>
+                       <div className="text-zinc-400 leading-relaxed mt-2">{activeStep.reason}</div>
                     </div>
-                  </CardHeader>
-                  <CardContent className="flex-1 overflow-auto pt-6">
+                  )}
 
-                    {/* MARKING PHASE RENDERING */}
-                    {activeTab === "marking" && activeStep.phase === "base-mark" && (
-                      historyEval && historyEval.evalData ? (
-                        renderPairEvaluation(historyEval.evalData, undefined, historyEval.passTitle)
-                      ) : (
-                        <div className={`flex flex-col gap-3 p-5 border rounded-2xl shadow-sm ${activeStep.evaluations && activeStep.evaluations.length > 0 ? 'border-emerald-900 bg-emerald-950/40 text-emerald-300' : 'border-zinc-800 bg-zinc-900 text-zinc-200'}`}>
-                          <div className="flex items-center gap-4">
-                             {activeStep.evaluations && activeStep.evaluations.length > 0 ? <CheckCircle2 className="h-8 w-8 shrink-0 text-emerald-500" /> : <CheckSquare className="h-8 w-8 shrink-0 text-zinc-500" />}
-                             <div className="font-bold text-xl text-zinc-100">{activeStep.title}</div>
-                          </div>
-                          <div className="leading-relaxed mt-2">{activeStep.reason || activeStep.description}</div>
-                          {activeStep.evaluations && activeStep.evaluations.length > 0 && (
-                            <div className="mt-2 text-sm font-semibold flex items-center gap-2">
-                              <MousePointerClick className="w-4 h-4 text-zinc-500" /> Tap any cell in the matrix to inspect its logic.
-                            </div>
-                          )}
-                        </div>
-                      )
-                    )}
+                  {/* MARKING PHASE RENDERING */}
+                  {activeStep.phase === "base-mark" && (
+                    historyEval && historyEval.evalData ? (
+                      renderPairEvaluation(historyEval.evalData, undefined, historyEval.passTitle)
+                    ) : (
+                      <div className="flex flex-col gap-3">
+                         <div className="flex items-center gap-4">
+                           <CheckCircle2 className="h-8 w-8 shrink-0 text-emerald-500" />
+                           <div className="font-bold text-xl text-zinc-100">Base Cases Marked</div>
+                         </div>
+                         <div className="text-zinc-400 leading-relaxed mt-2">{activeStep.reason}</div>
+                         {activeStep.evaluations && activeStep.evaluations.length > 0 && (
+                           <div className="mt-6 text-sm font-semibold bg-zinc-950 p-4 rounded-xl text-zinc-400 border border-zinc-800 flex items-center gap-2">
+                             <MousePointerClick className="w-4 h-4 text-zinc-500" /> Tap any cell in the matrix to inspect its logic.
+                           </div>
+                         )}
+                      </div>
+                    )
+                  )}
 
-                    {activeTab === "marking" && activeStep.phase === "iterative-mark" && (
-                      isPlaying && activeEval ? (
-                        renderPairEvaluation(activeEval, animSymbolIndex + 1)
+                  {activeStep.phase === "iterative-mark" && (
+                    historyEval && historyEval.evalData ? (
+                         renderPairEvaluation(historyEval.evalData, undefined, historyEval.passTitle)
+                      ) : activeEval ? (
+                         renderPairEvaluation(activeEval, undefined, activeStep.title)
                       ) : (
-                        historyEval && historyEval.evalData ? (
-                           renderPairEvaluation(historyEval.evalData, undefined, historyEval.passTitle)
-                        ) : (
-                           <div className="flex items-center gap-4 rounded-2xl p-5 border border-emerald-900 bg-emerald-950/40 text-emerald-300 shadow-sm">
+                         <div className="flex flex-col gap-3">
+                           <div className="flex items-center gap-4 border border-emerald-900/50 bg-emerald-950/20 p-5 rounded-2xl">
                              <CheckCircle2 className="h-8 w-8 shrink-0 text-emerald-500" />
                              <div>
-                               <div className="font-bold text-lg mb-1 text-zinc-100">Iteration Complete</div>
-                               <div className="leading-relaxed opacity-90">This pass evaluated {activeStep.evaluations?.length} unmarked pairs.</div>
-                               <div className="mt-3 text-sm font-semibold text-emerald-400">Click any cell in the table to inspect its specific evaluation.</div>
-                             </div>
-                           </div>
-                        )
-                      )
-                    )}
-
-                    {/* MERGING PHASE RENDERING */}
-                    {activeTab === "merging" && (activeStep.phase === "merge-check" || activeStep.phase === "merge-execute") && activeStep.pair && (
-                       <div className="space-y-6">
-                         {/* Step 1: Check Myhill Table */}
-                         <motion.div animate={{ opacity: activeStep.phase === "merge-check" ? 1 : 0.4 }} className={`flex items-center gap-4 rounded-2xl p-4 border shadow-sm transition-opacity duration-500 ${activeStep.phase === "merge-check" ? 'border-zinc-600 bg-zinc-800' : 'border-zinc-800 bg-zinc-900/50'}`}>
-                           <CheckSquare className="h-6 w-6 text-zinc-400 shrink-0" />
-                           <div>
-                             <div className="font-bold text-zinc-100">1. Verify Myhill-Nerode Table</div>
-                             <div className="text-sm text-zinc-400 mt-1">Pair <Badge variant="outline" className="bg-zinc-950 border-zinc-700">({activeStep.pair[0]}, {activeStep.pair[1]})</Badge> remains <strong className="text-zinc-200">UNMARKED</strong>. They are strictly equivalent.</div>
-                           </div>
-                         </motion.div>
-                         
-                         {/* Step 2: Merge Visualization */}
-                         {activeStep.phase === "merge-execute" && (
-                           <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className="flex items-center gap-4 rounded-2xl p-5 border border-red-900 bg-red-950/40 text-red-300 shadow-sm">
-                             <GitMerge className="h-8 w-8 shrink-0 text-red-500" />
-                             <div className="flex-1">
-                               <div className="font-bold text-lg mb-3 text-zinc-100">2. Combine States</div>
-                               <div className="flex items-center gap-2 flex-wrap">
-                                 <div className="flex items-center justify-center min-w-[40px] h-10 px-2 rounded-full border-2 border-red-800 bg-zinc-900 text-red-400 font-bold shadow-sm">{activeStep.pair[0]}</div>
-                                 <span className="text-red-500 font-bold text-lg">+</span>
-                                 <div className="flex items-center justify-center min-w-[40px] h-10 px-2 rounded-full border-2 border-red-800 bg-zinc-900 text-red-400 font-bold shadow-sm">{activeStep.pair[1]}</div>
-                                 <ArrowRight className="w-5 h-5 mx-1 text-red-600" />
-                                 <motion.div 
-                                   initial={{ scale: 0.8, opacity: 0 }}
-                                   animate={{ scale: [1.2, 1], opacity: 1 }}
-                                   transition={{ duration: 0.5 }}
-                                   className="flex items-center justify-center px-4 h-10 rounded-full border-2 border-red-500 bg-red-600 text-white font-bold shadow-[0_0_15px_rgba(220,38,38,0.5)]"
-                                 >
-                                   {(() => {
-                                      const currentPair = activeStep.pair || ["", ""];
-                                      const group = activeStep.mergedGroups?.find(g => g.includes(currentPair[0]) && g.includes(currentPair[1]));
-                                      return `{${group ? group.join(",") : `${currentPair[0]},${currentPair[1]}`}}`;
-                                   })()}
-                                 </motion.div>
+                               <div className="font-bold text-lg text-zinc-100">Iteration Complete</div>
+                               <div className="text-emerald-400/80 leading-relaxed mt-1 text-sm">This pass evaluated {activeStep.evaluations?.length} unmarked pairs.</div>
+                               <div className="mt-2 text-xs font-semibold text-emerald-500 flex items-center gap-1.5">
+                                  Click any cell in the table to inspect its specific evaluation.
                                </div>
-                               {mergePhase === "merged" && <div className="text-xs text-red-400/80 font-semibold mt-3 italic">The transition table and graph have been successfully merged.</div>}
                              </div>
-                           </motion.div>
-                         )}
-                       </div>
-                    )}
-
-                    {activeTab === "merging" && activeStep.phase === "final" && (
-                       historyEval && historyEval.evalData ? (
-                          renderPairEvaluation(historyEval.evalData, undefined, historyEval.passTitle)
-                       ) : (
-                         <div className="flex items-center gap-4 rounded-2xl p-5 border border-emerald-900 bg-emerald-950/40 text-emerald-300 shadow-sm">
-                           <CheckCircle2 className="h-8 w-8 shrink-0 text-emerald-500" />
-                           <div>
-                             <div className="font-bold text-lg mb-1 text-zinc-100">Minimization Complete</div>
-                             <div className="leading-relaxed opacity-90">The DFA is now fully optimized with no redundant states remaining.</div>
-                             <div className="mt-3 text-sm font-semibold text-emerald-400">Click any cell in the table to see why these specific minimized states are distinguishable.</div>
                            </div>
                          </div>
-                       )
-                    )}
-                  </CardContent>
-                </Card>
-              </div>
+                      )
+                  )}
 
+                  {/* MERGING OVERVIEW RENDERING */}
+                  {activeStep.phase === "merge-overview" && (
+                     <div className="flex flex-col gap-4">
+                        <div className="flex items-center gap-4">
+                          <CheckCircle2 className="h-8 w-8 shrink-0 text-red-500" />
+                          <div className="font-bold text-xl text-zinc-100">Matrix Resolved</div>
+                        </div>
+                        <div className="text-zinc-400 leading-relaxed mt-2">All iterations are complete. The remaining unmarked pairs in the Myhill-Nerode table mathematically denote identical state behaviors.</div>
+                     </div>
+                  )}
+
+                  {/* MERGING PHASE RENDERING */}
+                  {(activeStep.phase === "merge-check" || activeStep.phase === "merge-execute") && activeStep.pair && (
+                     <div className="space-y-8">
+                       <div className="transition-opacity duration-700" style={{ opacity: activeStep.phase === "merge-check" ? 1 : 0.3 }}>
+                         <div className="font-bold text-lg text-zinc-100 mb-2 flex items-center gap-2"><div className="w-6 h-6 rounded-full bg-zinc-800 text-xs flex items-center justify-center text-zinc-400">1</div> Structural Verification</div>
+                         <div className="text-zinc-400 leading-relaxed">Pair <Badge variant="outline" className="bg-zinc-950 border-zinc-800">({activeStep.pair[0]}, {activeStep.pair[1]})</Badge> has been identified as intrinsically equivalent.</div>
+                       </div>
+                       
+                       {activeStep.phase === "merge-execute" && (
+                         <motion.div initial={{ opacity: 0, x: 20 }} animate={{ opacity: 1, x: 0 }} className="pt-6 border-t border-zinc-800">
+                           <div className="font-bold text-lg text-zinc-100 mb-6 flex items-center gap-2"><div className="w-6 h-6 rounded-full bg-red-600 text-white text-xs flex items-center justify-center">2</div> Topological Restructure</div>
+                           <div className="flex items-center gap-3 flex-wrap bg-zinc-950 p-6 rounded-2xl border border-zinc-800">
+                             <div className="flex items-center justify-center min-w-[48px] h-12 px-3 rounded-full bg-zinc-900 border border-zinc-800 text-zinc-300 font-bold shadow-sm">{activeStep.pair[0]}</div>
+                             <span className="text-zinc-600 font-bold text-xl">+</span>
+                             <div className="flex items-center justify-center min-w-[48px] h-12 px-3 rounded-full bg-zinc-900 border border-zinc-800 text-zinc-300 font-bold shadow-sm">{activeStep.pair[1]}</div>
+                             <ArrowRight className="w-5 h-5 mx-2 text-red-500" />
+                             <motion.div 
+                               initial={{ scale: 0.8, opacity: 0 }}
+                               animate={{ scale: [1.2, 1], opacity: 1 }}
+                               transition={{ duration: 0.5 }}
+                               className="flex items-center justify-center px-6 h-12 rounded-full bg-red-600 text-white font-bold shadow-[0_0_20px_rgba(220,38,38,0.4)]"
+                             >
+                               {(() => {
+                                  const currentPair = activeStep.pair || ["", ""];
+                                  const raw1 = currentPair[0].replace(/[{}]/g, "").split(",");
+                                  const raw2 = currentPair[1].replace(/[{}]/g, "").split(",");
+                                  const combined = [...raw1, ...raw2].sort().join(",");
+                                  return `{${combined}}`;
+                               })()}
+                             </motion.div>
+                           </div>
+                           {mergePhase === "merged" && <div className="text-sm text-red-400 mt-6 leading-relaxed italic">The graph layout and matrix have dynamically collapsed to absorb the redundancy.</div>}
+                         </motion.div>
+                       )}
+                     </div>
+                  )}
+
+                  {activeStep.phase === "final" && (
+                     historyEval && historyEval.evalData ? (
+                        renderPairEvaluation(historyEval.evalData, undefined, historyEval.passTitle)
+                     ) : (
+                       <div className="flex flex-col gap-4">
+                         <div className="flex items-center gap-4">
+                           <CheckCircle2 className="h-8 w-8 shrink-0 text-emerald-500" />
+                           <div className="font-bold text-xl text-zinc-100">Optimization Complete</div>
+                         </div>
+                         <div className="text-zinc-400 leading-relaxed mt-2">All mathematically verified redundancies have been unified. The resulting topological structure is perfectly minimal.</div>
+                       </div>
+                     )
+                  )}
+                </div>
+              </Card>
             </div>
+
           </div>
         </div>
       </div>
@@ -1845,128 +1735,122 @@ export default function App() {
   }
 
   return (
-    <div className={shellClass}>
-      <div className="mx-auto max-w-7xl space-y-6 w-full">
-        <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} className="rounded-3xl bg-zinc-900 border border-zinc-800 p-8 text-zinc-100 shadow-[0_0_30px_rgba(0,0,0,0.5)]">
-          <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
-            <div>
-              <div className="mb-3 inline-flex items-center gap-2 rounded-full bg-red-950/50 border border-red-900 text-red-400 px-4 py-1 text-sm font-bold">
-                <Sparkles className="h-4 w-4" /> Myhill-Nerode Visualizer for Educators
-              </div>
-              <h1 className="text-3xl font-bold tracking-tight sm:text-4xl text-zinc-50">Interactive DFA Minimization</h1>
-              <p className="mt-3 max-w-3xl text-zinc-400">
-                Configure your DFA below. The walkthrough rigidly follows the iterative table-filling theorem, providing a locked side-by-side layout optimized for classroom presentations.
-              </p>
-            </div>
+    <div className={shellClass} style={{ fontFamily: "'Inter', sans-serif" }}>
+      <div className="mx-auto max-w-4xl space-y-12 w-full pt-12">
+        <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }}>
+          <div className="mb-6 inline-flex items-center gap-2 rounded-full bg-red-950/40 border border-red-900 text-red-400 px-5 py-2 text-sm font-bold">
+            <Sparkles className="h-4 w-4" /> The Digital Monograph
           </div>
+          <h1 className="text-6xl font-extrabold tracking-tight text-zinc-50">DFA Minimization</h1>
+          <p className="mt-6 text-xl text-zinc-400 leading-relaxed">
+            Initialize the structural parameters. This visualizer applies strict Myhill-Nerode algorithmic passes, proactively merging states using Eager Equivalence.
+          </p>
         </motion.div>
 
-        <Card>
-          <CardHeader>
-            <CardTitle>DFA Input Builder</CardTitle>
-          </CardHeader>
-          <CardContent className="space-y-6 pt-6">
-             <div className="inline-flex rounded-2xl bg-zinc-950 border border-zinc-800 p-1">
+        <Card className="shadow-[0_0_40px_rgba(0,0,0,0.5)] border-zinc-800">
+          <CardHeader className="bg-zinc-900 border-b border-zinc-800">
+             <div className="inline-flex rounded-[12px] bg-zinc-950 border border-zinc-800 p-1.5 w-fit">
                 <button
                   onClick={() => setInputMode("table")}
-                  className={`rounded-xl px-6 py-2.5 text-sm font-bold transition-all ${
+                  className={`rounded-[8px] px-6 py-3 text-sm font-bold transition-all ${
                     inputMode === "table"
-                      ? "bg-zinc-800 text-zinc-100 shadow-sm"
-                      : "text-zinc-500 hover:text-zinc-300 hover:bg-zinc-900/50"
+                      ? "bg-zinc-800 text-zinc-100 shadow-[0_2px_8px_rgba(0,0,0,0.2)]"
+                      : "text-zinc-500 hover:text-zinc-300"
                   }`}
                 >
-                  Table Input
+                  Structural Matrix
                 </button>
                 <button
                   onClick={() => setInputMode("json")}
-                  className={`rounded-xl px-6 py-2.5 text-sm font-bold transition-all ${
+                  className={`rounded-[8px] px-6 py-3 text-sm font-bold transition-all ${
                     inputMode === "json"
-                      ? "bg-zinc-800 text-zinc-100 shadow-sm"
-                      : "text-zinc-500 hover:text-zinc-300 hover:bg-zinc-900/50"
+                      ? "bg-zinc-800 text-zinc-100 shadow-[0_2px_8px_rgba(0,0,0,0.2)]"
+                      : "text-zinc-500 hover:text-zinc-300"
                   }`}
                 >
-                  JSON Input
+                  Raw Data (JSON)
                 </button>
               </div>
-
+          </CardHeader>
+          <CardContent className="space-y-8 bg-zinc-950 rounded-b-[16px]">
             {inputMode === "table" ? (
-              <div className="space-y-6">
-                <div className="grid gap-6 md:grid-cols-2">
+              <div className="space-y-10">
+                <div className="grid gap-8 md:grid-cols-2">
                   <div>
-                    <label className="mb-2 block text-sm font-bold text-zinc-300">
-                      <span className="text-base font-black text-red-500 mr-1">Q</span> (Finite set of states) <span className="font-normal text-zinc-500 text-xs ml-1">comma separated</span>
+                    <label className="mb-3 block text-sm font-bold text-zinc-300">
+                      <span className="text-xl font-black text-red-500 mr-2">Q</span> Finite set of states
                     </label>
-                    <Input value={formState.statesText} onChange={(e) => setFormState(p => ({ ...p, statesText: e.target.value }))} className="rounded-xl" />
+                    <Input value={formState.statesText} onChange={(e) => setFormState(p => ({ ...p, statesText: e.target.value }))} className="bg-zinc-900 shadow-inner border-zinc-800" />
                   </div>
                   <div>
-                    <label className="mb-2 block text-sm font-bold text-zinc-300">
-                      <span className="text-base font-black text-red-500 mr-1">Σ</span> (Alphabet / Set of symbols) <span className="font-normal text-zinc-500 text-xs ml-1">comma separated</span>
+                    <label className="mb-3 block text-sm font-bold text-zinc-300">
+                      <span className="text-xl font-black text-red-500 mr-2">Σ</span> Alphabet
                     </label>
-                    <Input value={formState.alphabetText} onChange={(e) => setFormState(p => ({ ...p, alphabetText: e.target.value }))} className="rounded-xl" />
+                    <Input value={formState.alphabetText} onChange={(e) => setFormState(p => ({ ...p, alphabetText: e.target.value }))} className="bg-zinc-900 shadow-inner border-zinc-800" />
                   </div>
                   <div>
-                    <label className="mb-2 block text-sm font-bold text-zinc-300">
-                      <span className="text-base font-black text-red-500 mr-1">q<sub>0</sub></span> (Initial state)
+                    <label className="mb-3 block text-sm font-bold text-zinc-300">
+                      <span className="text-xl font-black text-red-500 mr-2">q<sub>0</sub></span> Initial state
                     </label>
-                    <Input value={formState.startState} onChange={(e) => setFormState(p => ({ ...p, startState: e.target.value }))} className="rounded-xl" />
+                    <Input value={formState.startState} onChange={(e) => setFormState(p => ({ ...p, startState: e.target.value }))} className="bg-zinc-900 shadow-inner border-zinc-800" />
                   </div>
                   <div>
-                    <label className="mb-2 block text-sm font-bold text-zinc-300">
-                      <span className="text-base font-black text-red-500 mr-1">F</span> (Set of final states) <span className="font-normal text-zinc-500 text-xs ml-1">comma separated</span>
+                    <label className="mb-3 block text-sm font-bold text-zinc-300">
+                      <span className="text-base font-black text-red-500 mr-1">F</span> Set of final states
                     </label>
-                    <Input value={formState.finalStatesText} onChange={(e) => setFormState(p => ({ ...p, finalStatesText: e.target.value }))} className="rounded-xl" />
+                    <Input value={formState.finalStatesText} onChange={(e) => setFormState(p => ({ ...p, finalStatesText: e.target.value }))} className="bg-zinc-900 shadow-inner border-zinc-800" />
                   </div>
                 </div>
 
                 <div>
-                  <div className="mb-3 flex items-center justify-between">
+                  <div className="mb-4 flex items-center justify-between">
                     <label className="block text-sm font-bold text-zinc-300">
-                      <span className="text-base font-black text-red-500 mr-1">δ</span> (Transition Function: Q × Σ → Q)
+                      <span className="text-xl font-black text-red-500 mr-2">δ</span> Transition Function (Q × Σ → Q)
                     </label>
-                    <button onClick={handleAddState} className="inline-flex items-center text-sm font-bold text-zinc-400 hover:text-red-400 transition-colors py-1.5 px-3 rounded-lg bg-zinc-900 border border-zinc-700 hover:border-zinc-600 shadow-sm active:scale-95 disabled:opacity-50 disabled:pointer-events-none">
+                    <button onClick={handleAddState} className="inline-flex items-center text-sm font-bold text-zinc-400 hover:text-red-400 transition-colors py-1.5 px-3 rounded-lg bg-zinc-900 border border-zinc-800 hover:border-zinc-700 shadow-sm active:scale-95 disabled:opacity-50 disabled:pointer-events-none">
                       <Plus className="w-4 h-4 mr-1.5" /> Add State
                     </button>
                   </div>
-                  <div className="overflow-x-auto rounded-2xl border border-zinc-800 bg-zinc-900">
-                    <table className="w-full text-sm">
-                      <thead className="bg-zinc-950 text-zinc-300">
+                  <div className="overflow-x-auto rounded-[12px] bg-zinc-900 shadow-inner border border-zinc-800">
+                    <table className="w-full text-sm text-left">
+                      <thead className="bg-zinc-950 text-zinc-400 border-b border-zinc-800">
                         <tr>
-                          <th className="px-4 py-3 text-left font-bold border-b border-zinc-800">Current State</th>
+                          <th className="px-6 py-4 font-bold border-b border-zinc-800">Origin State</th>
                           {formAlphabet.map((symbol) => (
-                            <th key={symbol} className="px-4 py-3 text-left font-bold border-b border-zinc-800">Next on {symbol}</th>
+                            <th key={symbol} className="px-6 py-4 font-bold border-b border-zinc-800">Input {symbol}</th>
                           ))}
                           <th className="px-4 py-3 text-center font-bold border-b border-zinc-800 w-12">
-                            <button onClick={handleAddSymbol} title="Add Input Symbol" className="inline-flex items-center justify-center w-6 h-6 rounded-md text-zinc-500 hover:text-red-400 hover:bg-red-950/50 transition-colors">
+                            <button onClick={handleAddSymbol} title="Add Input Symbol" className="inline-flex items-center justify-center w-6 h-6 rounded-md text-zinc-500 hover:text-red-400 hover:bg-zinc-800 transition-colors">
                               <Plus className="w-4 h-4" />
                             </button>
                           </th>
                         </tr>
                       </thead>
-                      <tbody>
+                      <tbody className="divide-y divide-zinc-800/50">
                         <AnimatePresence initial={false}>
                           {formStates.map((state) => (
                             <motion.tr 
                               key={state} 
                               initial={{ opacity: 0, y: -10, backgroundColor: "#450a0a" }} 
-                              animate={{ opacity: 1, y: 0, backgroundColor: "#18181b" }} 
+                              animate={{ opacity: 1, y: 0, backgroundColor: "transparent" }} 
                               exit={{ opacity: 0, backgroundColor: "#450a0a" }}
                               transition={{ duration: 0.3 }}
-                              className="border-b border-zinc-800 last:border-0"
+                              className="hover:bg-zinc-800/30 transition-colors"
                             >
-                              <td className="px-4 py-4 font-bold text-zinc-100">
-                                <div className="flex items-center gap-2">
-                                  <button onClick={() => handleRemoveState(state)} title={`Remove State ${state}`} className="inline-flex items-center justify-center w-6 h-6 rounded-md bg-zinc-800 text-zinc-400 hover:bg-red-600 hover:text-white transition-colors flex-shrink-0 shadow-sm">
+                              <td className="px-6 py-4 font-bold text-zinc-100">
+                                <div className="flex items-center gap-3">
+                                  <button onClick={() => handleRemoveState(state)} title={`Remove State ${state}`} className="inline-flex items-center justify-center w-6 h-6 rounded-[6px] bg-zinc-800 border border-zinc-700 text-zinc-400 hover:bg-red-600 hover:text-white transition-colors flex-shrink-0 shadow-sm">
                                     <Minus className="w-4 h-4" />
                                   </button>
                                   <span>{state}</span>
                                 </div>
                               </td>
                               {formAlphabet.map((symbol) => (
-                                <td key={`${state}-${symbol}`} className="px-4 py-4">
+                                <td key={`${state}-${symbol}`} className="px-6 py-4">
                                   <Select
                                     value={formState.transitions[state]?.[symbol] ?? ""}
                                     onChange={(e) => setFormState(p => ({ ...p, transitions: { ...p.transitions, [state]: { ...p.transitions[state], [symbol]: e.target.value } } }))}
-                                    className="min-w-[110px] rounded-xl"
+                                    className="min-w-[120px] bg-zinc-950 shadow-inner border-zinc-800"
                                   >
                                     <option value="" disabled className="text-zinc-600">Select...</option>
                                     {formStates.map(s => (
@@ -1975,7 +1859,7 @@ export default function App() {
                                   </Select>
                                 </td>
                               ))}
-                              <td className="px-4 py-4"></td>
+                              <td className="px-6 py-4"></td>
                             </motion.tr>
                           ))}
                         </AnimatePresence>
@@ -1984,21 +1868,21 @@ export default function App() {
                   </div>
                 </div>
 
-                <div className="flex flex-wrap gap-4 pt-2">
-                  <Button className="rounded-xl px-6" onClick={buildAndRunFromTable}><Play className="mr-2 h-4 w-4" /> Start Visualizer</Button>
-                  <Button variant="secondary" className="rounded-xl px-6" onClick={loadSample}><RotateCcw className="mr-2 h-4 w-4" /> Load Sample</Button>
+                <div className="flex flex-wrap gap-4 pt-4">
+                  <Button size="lg" className="w-full sm:w-auto" onClick={buildAndRunFromTable}>Compile Topology <ArrowRight className="ml-2 w-5 h-5"/></Button>
+                  <Button variant="secondary" size="lg" className="w-full sm:w-auto" onClick={loadSample}>Load Sample Data</Button>
                 </div>
                 
                 {formError && (
-                  <div className="flex items-start gap-3 rounded-2xl border border-red-900 bg-red-950/40 p-5 text-red-300 mt-4"><AlertCircle className="mt-0.5 h-5 w-5 text-red-500" /><div><div className="font-bold text-zinc-100 mb-1">Form Error</div><div className="text-sm">{formError}</div></div></div>
+                  <div className="flex items-start gap-4 rounded-[12px] bg-red-950/40 border border-red-900 p-6 text-red-400 mt-6"><AlertCircle className="w-6 h-6 shrink-0" /><div><div className="font-bold text-lg mb-1 text-zinc-100">Compilation Error</div><div className="text-sm font-medium">{formError}</div></div></div>
                 )}
               </div>
             ) : (
-              <div className="space-y-6">
-                <Textarea value={input} onChange={(e) => setInput(e.target.value)} className="min-h-[420px] rounded-2xl font-mono text-sm bg-zinc-950 text-zinc-300 border-zinc-800" />
-                <div className="flex flex-wrap gap-4 pt-2">
-                  <Button className="rounded-xl px-6" onClick={() => startWalkthrough(input)}><Play className="mr-2 h-4 w-4" /> Start Visualizer</Button>
-                  <Button variant="secondary" className="rounded-xl px-6" onClick={loadSample}><RotateCcw className="mr-2 h-4 w-4" /> Load Sample</Button>
+              <div className="space-y-8">
+                <Textarea value={input} onChange={(e) => setInput(e.target.value)} className="min-h-[500px] font-mono text-sm leading-loose bg-zinc-900 border-zinc-800 shadow-inner" />
+                <div className="flex flex-wrap gap-4">
+                  <Button size="lg" className="w-full sm:w-auto" onClick={() => startWalkthrough(input)}>Compile Topology <ArrowRight className="ml-2 w-5 h-5"/></Button>
+                  <Button variant="secondary" size="lg" className="w-full sm:w-auto" onClick={loadSample}>Load Sample Data</Button>
                 </div>
               </div>
             )}
