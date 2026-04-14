@@ -20,7 +20,7 @@ const CardContent = React.forwardRef<HTMLDivElement, React.HTMLAttributes<HTMLDi
   <div ref={ref} className={`p-6 ${className || ""}`} {...props} />
 ));
 
-const Button = React.forwardRef<HTMLButtonElement, React.ButtonHTMLAttributes<HTMLButtonElement> & { variant?: "default" | "secondary" | "outline" | "destructive", size?: "default" | "sm" | "lg" | "icon" | "glass" }>(
+const Button = React.forwardRef<HTMLButtonElement, React.ButtonHTMLAttributes<HTMLButtonElement> & { variant?: "default" | "secondary" | "outline" | "destructive" | "glass", size?: "default" | "sm" | "lg" | "icon" | "glass" }>(
   ({ className, variant = "default", size = "default", ...props }, ref) => {
     const variants = {
       default: "bg-red-600 text-white hover:bg-red-500 shadow-md shadow-red-900/40 disabled:bg-red-900/50 disabled:text-white/60 disabled:shadow-none border-none",
@@ -290,7 +290,6 @@ function minimizeDFA(originalDfa: DFA): MinimizationResult {
   let activeDfa = originalDfa;
   let markedPairs = new Set<string>();
 
-  // Dynamic matrix builder that actively respects shrunken groups and normalized keys
   const getDynamicTable = (groups: string[][], markedSet: Set<string>, newMarksSet: Set<string> = new Set()): PairTableEntry[] => {
     const stateNames = groups.map(g => g.length > 1 ? `{${g.join(",")}}` : g[0]);
     const pairs = buildAllPairs(stateNames).map(([a,b]) => normalizePair(a,b)); 
@@ -329,7 +328,6 @@ function minimizeDFA(originalDfa: DFA): MinimizationResult {
     });
   };
 
-  // Step 0: Overview (Starts completely empty)
   steps.push({
     phase: "init",
     title: "Table Initialization",
@@ -340,7 +338,6 @@ function minimizeDFA(originalDfa: DFA): MinimizationResult {
     tableSnapshot: getDynamicTable(currentGroups, new Set())
   });
 
-  // Phase 1: Base Cases (Batched instantly)
   let baseMarksCount = 0;
   const baseEvaluations: PairEvaluation[] = [];
   const baseNewMarks = new Set<string>();
@@ -375,7 +372,6 @@ function minimizeDFA(originalDfa: DFA): MinimizationResult {
     tableSnapshot: getDynamicTable(currentGroups, markedPairs, baseNewMarks)
   });
 
-  // Phase 2 & 3: Hybrid Eager Merge Loop
   let changed = true;
   let pass = 1;
 
@@ -385,7 +381,6 @@ function minimizeDFA(originalDfa: DFA): MinimizationResult {
     const activeStateNames = activeDfa.states;
     const activePairs = buildAllPairs(activeStateNames).map(([a,b]) => normalizePair(a,b));
 
-    // --- 1. EAGER MERGE CHECK ---
     let eagerMergePair: [string, string] | null = null;
     
     for (const [nameA, nameB] of activePairs) {
@@ -457,7 +452,6 @@ function minimizeDFA(originalDfa: DFA): MinimizationResult {
         continue;
     }
 
-    // --- 2. REGULAR MARKING PASS (BATCHED for automatic playback) ---
     let newMarksInPass = 0;
     const passEvaluations: PairEvaluation[] = [];
     const passNewMarks = new Set<string>();
@@ -551,7 +545,6 @@ function minimizeDFA(originalDfa: DFA): MinimizationResult {
     if (newMarksInPass > 0) pass++;
   }
 
-  // --- 3. FINAL CLEANUP MERGES ---
   let finalChanged = true;
   while (finalChanged) {
       finalChanged = false;
@@ -612,7 +605,6 @@ function minimizeDFA(originalDfa: DFA): MinimizationResult {
       }
   }
 
-  // --- 4. FINAL VERIFICATION PASS ---
   const finalVerificationEvaluations: PairEvaluation[] = [];
   const finalActiveDfa = partitionsToGraph(originalDfa, currentGroups);
   const finalPairsList = buildAllPairs(finalActiveDfa.states).map(([a,b]) => normalizePair(a,b));
@@ -853,7 +845,7 @@ function GraphView({ dfa, title, graphKey, activeStates = [], mergeMode = false,
   const nodeRadius = 25;
   const arrowPadding = 27; 
 
-  const animTransition = { duration: isDragging ? 0 : 0.8, ease: [0.16, 1, 0.3, 1] }; 
+  const animTransition: any = { duration: isDragging ? 0 : 0.8, ease: "easeInOut" }; 
 
   useEffect(() => {
     const paddingX = 95;
@@ -1303,7 +1295,7 @@ export default function App() {
       : evalObj.symbolChecks.length;
 
     if (animSymbolIndex < maxSymbolIndex) {
-      const timer = setTimeout(() => setAnimSymbolIndex(s => s + 1), 300); // Slower: 300ms per symbol
+      const timer = setTimeout(() => setAnimSymbolIndex(s => s + 1), 300); 
       return () => clearTimeout(timer);
     } else {
       const timer = setTimeout(() => {
@@ -1313,7 +1305,7 @@ export default function App() {
         } else {
           setIsPlaying(false); // Stop when the pass finishes so user can click
         }
-      }, 800); // Slower: 800ms between pairs
+      }, 800); 
       return () => clearTimeout(timer);
     }
   }, [isPlaying, activeStep, animIndex, animSymbolIndex]);
@@ -1558,59 +1550,102 @@ export default function App() {
     return (
       <div className={shellClass}>
         
-        {/* Floating Controls with Frosted Glass (Restored to bottom center) */}
-        <div className="fixed bottom-8 left-1/2 -translate-x-1/2 z-50 flex items-center gap-2 bg-zinc-900/90 backdrop-blur-md p-2 rounded-2xl shadow-[0_12px_40px_rgba(0,0,0,0.5)] border border-zinc-800">
-           <Button variant="secondary" size="icon" onClick={handlePrev} disabled={isFirstStep} title="Previous Step" className="rounded-xl h-12 w-12 bg-zinc-950 border-zinc-800 hover:bg-zinc-800 text-zinc-300">
-             <ArrowLeft className="w-5 h-5 stroke-[2.5]" />
+        {/* Floating Controls with Frosted Glass */}
+        <div className="fixed bottom-8 left-1/2 -translate-x-1/2 z-50 flex items-center gap-4 bg-zinc-900/80 backdrop-blur-md p-2 rounded-full shadow-[0_12px_40px_rgba(0,0,0,0.5)] border border-zinc-700">
+           <Button variant="glass" size="icon" onClick={handlePrev} disabled={isFirstStep} title="Previous Step (Left Arrow)">
+             <ArrowLeft className="w-6 h-6 stroke-[2.5] text-zinc-100" />
            </Button>
-           <Button variant="secondary" size="icon" onClick={() => setView("input")} title="Home" className="rounded-xl h-12 w-12 bg-zinc-950 border-zinc-800 hover:bg-zinc-800 text-zinc-300">
-             <Home className="w-5 h-5 stroke-[2.5]" />
+           <Button variant="glass" size="icon" onClick={() => setView("input")} title="Home">
+             <Home className="w-5 h-5 stroke-[2.5] text-zinc-100" />
            </Button>
-           <Button variant="default" size="icon" onClick={handleNext} disabled={isLastStep || mergePhase === "merging"} title="Next Step" className="rounded-xl h-12 w-12 bg-red-600 hover:bg-red-500 shadow-md shadow-red-900/50">
-             <ArrowRight className="w-5 h-5 stroke-[2.5] text-white" />
+           <Button variant="default" size="icon" onClick={handleNext} disabled={isLastStep || mergePhase === "merging"} title="Next Step (Right Arrow)" className="rounded-full h-14 w-14">
+             <ArrowRight className="w-6 h-6 stroke-[2.5]" />
            </Button>
         </div>
 
-        <div className="mx-auto max-w-[1600px] w-full flex-1 flex flex-col gap-6 pb-24">
+        <div className="mx-auto max-w-[1600px] w-full flex-1 flex flex-col gap-12 pb-20">
           
-          {/* ROW 1: GRAPH (Full Width) */}
-          <div className="w-full h-[50vh] min-h-[450px]">
-            <GraphView 
-              dfa={currentGraphState!} 
-              title={['merge-overview', 'merge-check', 'merge-execute', 'final'].includes(activeStep.phase) ? "Minimized Synthesis" : "Original DFA Graph"}
-              graphKey={`graph-${currentStepIndex}`} 
-              activeStates={highlightedPair || (activeStep.pair ? activeStep.pair : [])} 
-              mergeMode={activeStep.phase.includes('merge')}
-              mergingPair={activeStep.phase === "merge-execute" && mergePhase === "merging" ? activeStep.mergingNodes : null}
-            />
-          </div>
-
-          {/* ROW 2: MATRIX & LOGIC PANEL */}
-          <div className="w-full grid grid-cols-1 lg:grid-cols-2 gap-6 min-h-[350px]">
-            
-            {/* LEFT: Matrix */}
-            <div className="min-h-[350px]">
-               <TriangularTableSnapshot 
-                 dfa={currentGraphState!} 
-                 rows={currentTableRows} 
-                 activePair={highlightedPair || (activeStep.pair ? activeStep.pair : null)}
-                 title="Myhill-Nerode Markings"
-                 onCellClick={handleCellClick}
-               />
+          {/* HEADER */}
+          <div className="flex flex-col gap-6 lg:flex-row lg:items-end lg:justify-between">
+            <div className="max-w-2xl">
+              <div className="flex items-center gap-4 mb-4">
+                <Button variant="secondary" size="icon" onClick={() => setView("input")} title="Home" className="h-10 w-10 shrink-0 border-zinc-700 bg-zinc-800 shadow-sm hover:bg-zinc-700">
+                  <Home className="w-4 h-4 text-zinc-100" />
+                </Button>
+                <h1 className="text-5xl font-extrabold tracking-tight text-zinc-50">DFA Minimization</h1>
+              </div>
+              <p className="text-lg text-zinc-400 leading-relaxed">
+                An interactive exploration of the Myhill-Nerode theorem. Observe structural equivalencies to derive the minimal topological state machine.
+              </p>
             </div>
             
-            {/* RIGHT: Editorial Step Logic */}
-            <div className="min-h-[350px]">
-              <Card className="h-full flex flex-col shadow-[0_0_30px_rgba(0,0,0,0.5)] border-zinc-800 bg-zinc-900 overflow-hidden">
-                <div className="px-8 py-6 border-b border-zinc-800/50">
-                  <div className="text-[10px] font-bold tracking-widest text-red-500 uppercase mb-2 flex items-center justify-between">
-                    <span>{['init', 'base-mark', 'iterative-mark'].includes(activeStep.phase) ? "Step Logic: Table Filling" : "Step Logic: Merging"}</span>
-                  </div>
-                  <h3 className="text-2xl font-bold text-zinc-50 leading-tight">{activeStep.title}</h3>
-                  <p className="text-sm text-zinc-400 mt-2 leading-relaxed">{activeStep.description}</p>
+            {/* PROGRESS BREADCRUMBS */}
+            <div className="flex bg-zinc-950 border border-zinc-800 p-1.5 rounded-2xl w-fit shadow-inner">
+              <div className={`flex items-center gap-2 px-6 py-2.5 rounded-[12px] text-sm font-bold transition-all duration-300 ${['init', 'base-mark', 'iterative-mark'].includes(activeStep.phase) ? "bg-red-600 text-white shadow-sm shadow-red-900/40" : "text-zinc-500"}`}>
+                <FileSearch className="w-4 h-4" /> 1. Matrix Evaluation
+              </div>
+              <div className={`flex items-center gap-2 px-6 py-2.5 rounded-[12px] text-sm font-bold transition-all duration-300 ${['merge-overview', 'merge-check', 'merge-execute'].includes(activeStep.phase) ? "bg-red-600 text-white shadow-sm shadow-red-900/40" : "text-zinc-500"}`}>
+                <GitMerge className="w-4 h-4" /> 2. Eager Merging
+              </div>
+              <div className={`flex items-center gap-2 px-6 py-2.5 rounded-[12px] text-sm font-bold transition-all duration-300 ${activeStep.phase === 'final' ? "bg-red-600 text-white shadow-sm shadow-red-900/40" : "text-zinc-500"}`}>
+                <CheckCircle2 className="w-4 h-4" /> 3. Minimized
+              </div>
+            </div>
+          </div>
+
+          {/* MAIN ASYMMETRICAL LAYOUT */}
+          <div className="flex-1 flex flex-col xl:flex-row gap-12 min-h-0">
+            
+            {/* LEFT COLUMN: Visualizations (Canvas + Tables) */}
+            <div className="w-full xl:w-2/3 flex flex-col gap-12">
+              <div className="h-[45vh] min-h-[400px]">
+                <GraphView 
+                  dfa={currentGraphState!} 
+                  title={['merge-overview', 'merge-check', 'merge-execute', 'final'].includes(activeStep.phase) ? "Minimized Synthesis" : "Base Topology"}
+                  graphKey={`graph-${currentStepIndex}`} 
+                  activeStates={highlightedPair || (activeStep.pair ? activeStep.pair : [])} 
+                  mergeMode={activeStep.phase.includes('merge')}
+                  mergingPair={activeStep.phase === "merge-execute" && mergePhase === "merging" ? activeStep.mergingNodes : null}
+                />
+              </div>
+
+              <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+                <div className="min-h-[250px]">
+                   <TriangularTableSnapshot 
+                     dfa={currentGraphState!} 
+                     rows={currentTableRows} 
+                     activePair={highlightedPair || (activeStep.pair ? activeStep.pair : null)}
+                     title="Myhill-Nerode Matrix"
+                     onCellClick={handleCellClick}
+                   />
                 </div>
                 
-                <div className="flex-1 overflow-auto p-8">
+                <div className="min-h-[250px]">
+                  <TransitionTable 
+                    dfa={currentGraphState!} 
+                    title="Structural Mappings" 
+                    highlightedStates={activeStep.pair && activeStep.pair[0] ? activeStep.pair : []}
+                    activeSymbol={activeSymbol}
+                  />
+                </div>
+              </div>
+            </div>
+
+            {/* RIGHT COLUMN: Editorial Step Logic */}
+            <div className="w-full xl:w-1/3">
+              <div className="sticky top-8 bg-zinc-900 rounded-[24px] shadow-[0_0_30px_rgba(0,0,0,0.5)] border border-zinc-800 overflow-hidden flex flex-col max-h-[85vh]">
+                <div className="bg-zinc-900/50 px-8 py-8 border-b border-zinc-800">
+                  <div className="text-xs font-bold tracking-widest text-red-500 uppercase mb-3 flex items-center justify-between">
+                    <span>{['init', 'base-mark', 'iterative-mark'].includes(activeStep.phase) ? "Matrix Evaluation" : "Topology Update"}</span>
+                    {activeStep.phase === "iterative-mark" && !historyEval && (
+                      <button onClick={handleReplay} className="text-zinc-500 hover:text-red-400 flex items-center gap-1 transition-colors font-bold"><RotateCcw className="w-3 h-3"/> Replay</button>
+                    )}
+                  </div>
+                  <h3 className="text-3xl font-bold text-zinc-50 leading-tight">{activeStep.title}</h3>
+                  <p className="text-base text-zinc-400 mt-4 leading-relaxed">{activeStep.description}</p>
+                </div>
+                
+                <div className="flex-1 overflow-auto p-8 bg-zinc-900">
                   {/* INIT PHASE RENDERING */}
                   {activeStep.phase === "init" && (
                     <div className="flex flex-col gap-3">
@@ -1649,15 +1684,13 @@ export default function App() {
                          renderPairEvaluation(activeEval, undefined, activeStep.title)
                       ) : (
                          <div className="flex flex-col gap-3">
-                           <div className="flex items-center gap-4 border border-emerald-900/50 bg-emerald-950/20 p-5 rounded-2xl">
-                             <CheckCircle2 className="h-8 w-8 shrink-0 text-emerald-500" />
-                             <div>
-                               <div className="font-bold text-lg text-zinc-100">Iteration Complete</div>
-                               <div className="text-emerald-400/80 leading-relaxed mt-1 text-sm">This pass evaluated {activeStep.evaluations?.length} unmarked pairs.</div>
-                               <div className="mt-2 text-xs font-semibold text-emerald-500 flex items-center gap-1.5">
-                                  Click any cell in the table to inspect its specific evaluation.
-                               </div>
-                             </div>
+                           <div className="flex items-center gap-4">
+                             <CheckCircle2 className="h-8 w-8 shrink-0 text-blue-500" />
+                             <div className="font-bold text-xl text-zinc-100">Iteration Complete</div>
+                           </div>
+                           <div className="text-zinc-400 leading-relaxed mt-2">The algorithmic pass evaluated {activeStep.evaluations?.length} unmarked pairs.</div>
+                           <div className="mt-6 text-sm font-semibold bg-zinc-950 p-4 rounded-xl text-zinc-400 border border-zinc-800 flex items-center gap-2">
+                             <MousePointerClick className="w-4 h-4 text-zinc-500" /> Tap any cell in the matrix to inspect its precise mathematical logic.
                            </div>
                          </div>
                       )
@@ -1725,7 +1758,7 @@ export default function App() {
                      )
                   )}
                 </div>
-              </Card>
+              </div>
             </div>
 
           </div>
